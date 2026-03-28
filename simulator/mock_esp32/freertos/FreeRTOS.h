@@ -14,11 +14,9 @@ typedef void (*TaskFunction_t)(void*);
 #define portEXIT_CRITICAL(mux)
 
 inline void vTaskDelay(uint32_t ticks) {
-    // For simulation, we can just skip this or use delay
+    // In mock, we don't block. Tasks are called at regular intervals by main.
 }
 
-inline void xTaskCreatePinnedToCore(TaskFunction_t task, const char* name, uint32_t stack, void* param, int prio, TaskHandle_t* handle, int core) {
-    // We will manually run these tasks in the simulation loop
-}
+void xTaskCreatePinnedToCore(TaskFunction_t task, const char* name, uint32_t stack, void* param, int prio, TaskHandle_t* handle, int core);
 
 #endif

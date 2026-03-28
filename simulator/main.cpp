@@ -9,6 +9,7 @@
 #include <vector>
 #include <cmath>
 #include <random>
+#include <algorithm>
 #include <fstream>
 #include <string>
 
@@ -24,6 +25,7 @@ float sp_x1=0, sp_x2=0, sp_y1=0, sp_y2=0;
 
 float disturbance_freq = 150.0f; // Hz
 float disturbance_freq2 = 300.0f; // Hz
+float drift_rate = 0.0f;         // Hz/s
 float t_global = 0;
 
 float current_dac_value = 0; // -1.0 to 1.0
@@ -36,9 +38,13 @@ void update_plant_sim() {
     float t = t_global;
     t_global += DT;
 
-    // 1. Generate Disturbance (Multi-tone)
-    current_dist = 0.5f * sin(2.0f * PI * disturbance_freq * t) +
-                 0.2f * sin(2.0f * PI * disturbance_freq2 * t + 0.5);
+    // Update drifting frequencies
+    float f_now1 = disturbance_freq + drift_rate * t;
+    float f_now2 = disturbance_freq2 + drift_rate * 2.1f * t;
+
+    // 1. Generate Disturbance (Multi-tone with drift)
+    current_dist = 0.5f * sin(2.0f * PI * f_now1 * t) +
+                 0.2f * sin(2.0f * PI * f_now2 * t + 0.5);
 
     current_adc_ref = current_dist + 0.01f * ((float)rand() / RAND_MAX - 0.5f);
 
@@ -133,6 +139,18 @@ void gpio_set_level(int pin, int level) {}
 // Include the firmware code
 #include "../src/avd_esp32.ino"
 
+// --- Background Task Runner ---
+struct SimTask {
+    TaskFunction_t func;
+    void* param;
+    uint32_t last_run_ms;
+};
+std::vector<SimTask> sim_tasks;
+
+void xTaskCreatePinnedToCore(TaskFunction_t task, const char* name, uint32_t stack, void* param, int prio, TaskHandle_t* handle, int core) {
+    sim_tasks.push_back({task, param, 0});
+}
+
 // --- Simulation Loop ---
 void run_simulation(int steps, std::ofstream& log) {
     for (int step = 0; step < steps; ++step) {
@@ -141,6 +159,15 @@ void run_simulation(int steps, std::ofstream& log) {
         // 4. Run Firmware Iteration (ISR)
         if (!sysid_running) {
             onTimer();
+        }
+
+        // Run background tasks (at ~50Hz)
+        uint32_t now_ms = (uint32_t)(t_global * 1000.0f);
+        for (auto& task : sim_tasks) {
+            if (now_ms - task.last_run_ms >= 20) {
+                task.func(task.param);
+                task.last_run_ms = now_ms;
+            }
         }
 
         if (step % 40 == 0) {
@@ -153,13 +180,16 @@ int main(int argc, char** argv) {
     float f_dist = 150.0f;
     float f_res = 200.0f;
     float Q = 5.0f;
+    float drift = 0.0f;
     std::string log_name = "sim_log.csv";
 
     if (argc >= 2) f_dist = std::stof(argv[1]);
     if (argc >= 3) f_res = std::stof(argv[2]);
     if (argc >= 4) log_name = argv[3];
+    if (argc >= 5) drift = std::stof(argv[4]);
 
     disturbance_freq = f_dist;
+    drift_rate = drift;
     disturbance_freq2 = f_dist * 2.1f; // Add a harmonic
     design_resonator(f_res, Q);
 
@@ -169,13 +199,13 @@ int main(int argc, char** argv) {
     log << "Time,Disturbance,Actuator,Error,RMS_E" << std::endl;
 
     std::cout << "Starting simulation: Disturbance=" << f_dist << "Hz, Resonance=" << f_res << "Hz" << std::endl;
-    run_simulation(8000, log); // 2 seconds
+    run_simulation(4000, log); // 1 second
 
     std::cout << "Running SYSID..." << std::endl;
     identifySecondaryPath();
 
     std::cout << "Resuming simulation with identified S_hat..." << std::endl;
-    run_simulation(12000, log); // 3 more seconds
+    run_simulation(8000, log); // 2 more seconds
 
     log.close();
     std::cout << "Simulation complete. Log written to " << log_name << std::endl;
