@@ -68,9 +68,9 @@ static constexpr int   W_TAPS  = 64;     // Adaptive cancellation filter W lengt
 static constexpr int   S_TAPS  = 16;     // Secondary-path model Ŝ length
 
 // ── FxLMS algorithm ───────────────────────────────────────────────────────
-static constexpr float MU0             = 5e-4f;    // Base step size μ₀
-static constexpr float MU_CEIL         = 1e-1f;    // Absolute ceiling on μ_n
-static constexpr float LEAKAGE         = 0.99999f; // Leaky factor: prevents weight blow-up
+static constexpr float MU0             = 0.05f;
+static constexpr float MU_CEIL         = 2e-1f;    // Absolute ceiling on μ_n
+static constexpr float LEAKAGE         = 0.9999f;
 static constexpr float POWER_ALPHA     = 0.999f;   // IIR smoothing for NLMS power estimate
 static constexpr float POWER_FLOOR     = 1e-8f;    // Prevents divide-by-zero
 
