@@ -1,35 +1,48 @@
-#ifndef ARDUINO_H
-#define ARDUINO_H
+#ifndef MOCK_ARDUINO_H
+#define MOCK_ARDUINO_H
 
 #include <iostream>
-#include <string>
-#include <vector>
-#include <cmath>
+#include <cstdint>
 #include <cstring>
-#include <chrono>
-#include <thread>
+#include <cmath>
+#include <string>
 #include <algorithm>
 
-#define IRAM_ATTR
-#define PI 3.14159265358979323846
+#ifndef PI
+#define PI 3.14159265358979323846f
+#endif
+
+typedef void (*voidFuncPtr)(void);
+void set_delay_callback(voidFuncPtr cb);
+
+void delay(uint32_t ms);
+void delayMicroseconds(uint32_t us);
+uint32_t millis();
+uint32_t micros();
 
 class String : public std::string {
 public:
-    using std::string::string;
+    String(const char* s = "") : std::string(s) {}
     String(const std::string& s) : std::string(s) {}
+
     void trim() {
-        this->erase(0, this->find_first_not_of(' '));
-        this->erase(this->find_last_not_of(' ') + 1);
+        erase(0, find_first_not_of(" \t\r\n"));
+        size_t last = find_last_not_of(" \t\r\n");
+        if (last != std::string::npos) erase(last + 1);
     }
+
     void toUpperCase() {
-        std::transform(this->begin(), this->end(), this->begin(), ::toupper);
+        std::transform(begin(), end(), begin(), ::toupper);
     }
+
     bool startsWith(const char* s) const {
-        return this->find(s) == 0;
+        return find(s) == 0;
     }
-    String substring(int from) const {
-        return String(this->substr(from));
+
+    String substring(int start) const {
+        return String(this->substr(start));
     }
+
     float toFloat() const {
         try {
             return std::stof(*this);
@@ -42,52 +55,37 @@ public:
 class SerialMock {
 public:
     void begin(int baud) {}
-    void print(const String& s) { std::cout << s; }
     void print(const char* s) { std::cout << s; }
-    void print(double d) { std::cout << d; }
-    void println(const String& s) { std::cout << s << std::endl; }
+    void print(float f) { std::cout << f; }
+    void print(int i) { std::cout << i; }
     void println(const char* s) { std::cout << s << std::endl; }
-    void println(double d) { std::cout << d << std::endl; }
-    void println() { std::cout << std::endl; }
-    template<typename... Args>
-    void printf(const char* format, Args... args) {
-        char buf[256];
-        snprintf(buf, sizeof(buf), format, args...);
-        std::cout << buf;
-    }
-    bool available() { return false; }
-    String readStringUntil(char terminator) { return ""; }
+    void println(float f) { std::cout << f << std::endl; }
+    void println(int i) { std::cout << i << std::endl; }
+    void printf(const char* fmt, ...);
+    int available() { return 0; }
+    String readStringUntil(char terminator) { return String(""); }
 };
 
 extern SerialMock Serial;
 
-// Simulator functions to call during delay
-void update_plant_sim();
+uint32_t esp_random();
 
-inline void delay(int ms) {
-    for (int i=0; i<ms; ++i) {
-        for (int j=0; j<1000/250; ++j) { // Assume 4kHz, so 4 ticks per ms
-            update_plant_sim();
-        }
-    }
-}
+#ifndef IRAM_ATTR
+#define IRAM_ATTR
+#endif
 
-inline void delayMicroseconds(int us) {
-    if (us >= 250) { // SAMPLE_PERIOD_US is 250
-        update_plant_sim();
-    }
-}
+#ifndef portMUX_TYPE
+#define portMUX_TYPE int
+#define portMUX_INITIALIZER_UNLOCKED 0
+#endif
 
-// Global time in milliseconds, updated by plant sim
-extern float t_global;
-inline uint32_t millis() {
-    return (uint32_t)(t_global * 1000.0f);
-}
+#ifndef portENTER_CRITICAL_ISR
+#define portENTER_CRITICAL_ISR(x)
+#define portEXIT_CRITICAL_ISR(x)
+#define portENTER_CRITICAL(x)
+#define portEXIT_CRITICAL(x)
+#endif
 
-inline uint32_t esp_random() {
-    return rand();
-}
-
-#define pdMS_TO_TICKS(ms) (ms)
+#define pdMS_TO_TICKS(x) (x)
 
 #endif
