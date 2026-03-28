@@ -26,6 +26,8 @@ float sp_x1=0, sp_x2=0, sp_y1=0, sp_y2=0;
 float disturbance_freq = 150.0f; // Hz
 float disturbance_freq2 = 300.0f; // Hz
 float drift_rate = 0.0f;         // Hz/s
+float plant_drift_rate = 0.0f;   // Hz/s (drift of mechanical resonance)
+float resonance_freq = 200.0f;
 float t_global = 0;
 
 float current_dac_value = 0; // -1.0 to 1.0
@@ -41,6 +43,27 @@ void update_plant_sim() {
     // Update drifting frequencies
     float f_now1 = disturbance_freq + drift_rate * t;
     float f_now2 = disturbance_freq2 + drift_rate * 2.1f * t;
+
+    // Update time-varying plant
+    if (plant_drift_rate != 0) {
+        float f_res_now = resonance_freq + plant_drift_rate * t;
+        // Keep resonance in a sane range
+        if (f_res_now < 50.0f) f_res_now = 50.0f;
+        if (f_res_now > 1800.0f) f_res_now = 1800.0f;
+
+        // Re-design resonator biquad coefficients on the fly
+        float omega = 2.0f * PI * f_res_now / FS;
+        float Q = 5.0f;
+        float alpha = sin(omega) / (2.0f * Q);
+        float a0 = 1.0f + alpha;
+        b0 = (1.0f - cos(omega)) / 2.0f / a0;
+        b1 = (1.0f - cos(omega)) / a0;
+        b2 = (1.0f - cos(omega)) / 2.0f / a0;
+        a1 = -2.0f * cos(omega) / a0;
+        a2 = (1.0f - alpha) / a0;
+        float gain = 1.0f / Q;
+        b0 *= gain; b1 *= gain; b2 *= gain;
+    }
 
     // 1. Generate Disturbance (Multi-tone with drift)
     current_dist = 0.5f * sin(2.0f * PI * f_now1 * t) +
@@ -65,6 +88,7 @@ void update_plant_sim() {
 
 // Design biquad coefficients for a simple resonator
 void design_resonator(float f_res, float Q) {
+    resonance_freq = f_res;
     float omega = 2.0f * PI * f_res / FS;
     float alpha = sin(omega) / (2.0f * Q);
 
@@ -188,6 +212,7 @@ int main(int argc, char** argv) {
     if (argc >= 4) log_name = argv[3];
     if (argc >= 5) drift = std::stof(argv[4]);
     if (argc >= 6) control_enabled = (std::stoi(argv[5]) != 0);
+    if (argc >= 7) plant_drift_rate = std::stof(argv[6]);
 
     disturbance_freq = f_dist;
     drift_rate = drift;

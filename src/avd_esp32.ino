@@ -74,6 +74,7 @@ static constexpr int   NUM_SOGI = 6;     // Number of parallel SOGI resonators
 // ── FxLMS algorithm ───────────────────────────────────────────────────────
 static constexpr float MU0             = 0.01f;    // FIR base step size
 static constexpr float MU_SOGI         = 0.03f;    // SOGI step size
+static constexpr float MU_S_HAT        = 0.005f;   // ASPM step size (slow and steady)
 static constexpr float MU_CEIL         = 0.3f;     // Absolute ceiling on μ_n
 static constexpr float LEAKAGE         = 0.9995f;  // Weights leakage to prevent drift
 static constexpr float POWER_ALPHA     = 0.999f;   // IIR smoothing for NLMS power estimate
@@ -117,6 +118,7 @@ struct SogiQSG {
     // Secondary path compensation at f_center
     float s_real, s_imag;
     bool  pending_update = false;
+    bool  pending_model_update = false;
     float next_f = 0;
 
     // Adaptive weights for this resonator
@@ -230,6 +232,11 @@ static float   sogi_freqs[NUM_SOGI] = {0};
 // ── DC blocking ───────────────────────────────────────────────────────────
 static float dc_ref = 0.0f, dc_err = 0.0f;
 
+// ── ASPM (Adaptive Secondary Path Modeling) ──────────────────────────────
+static bool           aspm_enabled = true;
+static float          dither_y     = 0.0f;
+static DelayLine<S_TAPS> dl_y;      // DAC output y[n] → ASPM Ŝ update
+
 // ── NLMS power estimate of filtered reference ─────────────────────────────
 static float xf_power = POWER_FLOOR;
 
@@ -289,10 +296,14 @@ void IRAM_ATTR onTimer() {
     float y_n = 0;
 
     // a. SOGI Tonal Cancellation
+    static int aspm_stride_idx = 0;
+    aspm_stride_idx = (aspm_stride_idx + 1) % 128; // Every ~30 ms, flag SOGI to re-eval plant response
+
     for (int i = 0; i < NUM_SOGI; i++) {
-        // Safe frequency update from background task
-        if (sogi_bank[i].pending_update) {
-            sogi_bank[i].updateFreq(sogi_bank[i].next_f, SAMPLE_RATE, s_hat);
+        // Safe frequency update or plant model update from background task
+        if (sogi_bank[i].pending_update || (aspm_enabled && aspm_stride_idx == 0)) {
+            float f = sogi_bank[i].pending_update ? sogi_bank[i].next_f : sogi_bank[i].f_center;
+            sogi_bank[i].updateFreq(f, SAMPLE_RATE, s_hat);
             sogi_bank[i].pending_update = false;
         }
 
@@ -323,6 +334,12 @@ void IRAM_ATTR onTimer() {
     dl_x.push(x_n);
     y_n += dl_x.dot(w);
 
+    // ── 3.5. Inject ASPM Dither (low-level white noise) ───────────────────
+    if (aspm_enabled) {
+        dither_y = 0.02f * ((float)esp_random() / (float)UINT32_MAX - 0.5f);
+        y_n += dither_y;
+    }
+
     // Clip to ±1.0 (hard limiter; protects actuator)
     if      (y_n >  1.0f) y_n =  1.0f;
     else if (y_n < -1.0f) y_n = -1.0f;
@@ -335,6 +352,20 @@ void IRAM_ATTR onTimer() {
     dl_s.push(x_n);
     const float xf_n = dl_s.dot(s_hat);
     dl_xf.push(xf_n);
+
+    // ── 6. Adaptive Secondary Path Modeling (ASPM) ───────────────────────
+    // We update Ŝ[n] to minimize E[ (e[n] - Ŝ * y[n])^2 ]
+    // This allows tracking mechanical changes during runtime.
+    if (aspm_enabled) {
+        dl_y.push(y_n);
+        float e_hat = dl_y.dot(s_hat); // Predicted error signal contribution from y
+        float e_aspm = e_n - e_hat;    // Residual (contains d[n] + modeling error)
+
+        // ASPM Update (LMS)
+        for (int i = 0; i < S_TAPS; i++) {
+            s_hat[i] += MU_S_HAT * e_aspm * dl_y.tap(i);
+        }
+    }
 
     // FIR Update (Normalized LMS)
     xf_power = POWER_ALPHA * xf_power + (1.0f - POWER_ALPHA) * xf_n * xf_n;
@@ -593,6 +624,10 @@ static void parseCmd(const String& raw) {
         // Run once after first power-on, or when the mechanical setup changes.
         identifySecondaryPath();
 
+    } else if (cmd.startsWith("ASPM ")) {
+        aspm_enabled = (cmd.substring(5).toInt() != 0);
+        Serial.printf("[CMD] ASPM = %s\n", aspm_enabled ? "ON" : "OFF");
+
     } else if (cmd == "WEIGHTS") {
         // Dump all W coefficients — useful for offline analysis.
         Serial.println("[CMD] W (adaptive filter):");
@@ -606,8 +641,12 @@ static void parseCmd(const String& raw) {
             Serial.printf("  s[%02d] = %+.6f\n", i, s_hat[i]);
 
     } else if (cmd == "STATUS") {
-        Serial.printf("[STATUS] RMS_E=%.5f  RMS_Y=%.5f  μ₀=%.2e  xf_pwr=%.2e\n",
-                      v_rms_e, v_rms_y, v_mu, xf_power);
+        // Calculate model power to check identification health
+        float model_pwr = 0;
+        for (int i = 0; i < S_TAPS; i++) model_pwr += s_hat[i] * s_hat[i];
+
+        Serial.printf("[STATUS] RMS_E=%.5f  RMS_Y=%.5f  μ₀=%.2e  ASPM=%s  ModPwr=%.2e\n",
+                      v_rms_e, v_rms_y, v_mu, aspm_enabled ? "ON" : "OFF", model_pwr);
 
     } else if (cmd == "SPEC") {
         // Dump full error spectrum (frequency : magnitude CSV)
@@ -627,6 +666,7 @@ static void parseCmd(const String& raw) {
             "║  WEIGHTS    Dump W coefficients              ║\n"
             "║  SPATH      Dump Ŝ coefficients              ║\n"
             "║  STATUS     Print RMS and μ                  ║\n"
+            "║  ASPM <0/1> Enable/Disable runtime modeling  ║\n"
             "║  SPEC       Dump error spectrum (CSV)        ║\n"
             "║  HELP       This message                     ║\n"
             "╚─────────────────────────────────────────────╝"

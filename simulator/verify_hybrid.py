@@ -10,11 +10,12 @@ import glob
 # 3. 250Hz Disturbance, 200Hz Resonance, 15Hz/s Drift (Tracking)
 
 scenarios = [
-    # f_dist, f_res, log_name, drift, control
-    (150, 200, "verify_150_off.csv", 0, 0),
-    (150, 200, "verify_150_on.csv", 0, 1),
-    (300, 200, "verify_300_on.csv", 0, 1),
-    (250, 200, "verify_drift_on.csv", 15, 1),
+    # f_dist, f_res, log_name, drift, control, plant_drift
+    (150, 200, "verify_150_off.csv", 0, 0, 0),
+    (150, 200, "verify_150_on.csv", 0, 1, 0),
+    (300, 200, "verify_300_on.csv", 0, 1, 0),
+    (250, 200, "verify_drift_on.csv", 15, 1, 0),
+    (150, 200, "verify_plant_drift.csv", 0, 1, 20), # 20 Hz/s plant resonance drift
 ]
 
 def run_verify():
@@ -22,8 +23,10 @@ def run_verify():
         print("Compiling simulator...")
         subprocess.run("g++ -DSIMULATOR -I simulator/mock_arduino -I simulator/mock_esp32 -I simulator/arduinoFFT simulator/main.cpp -o simulator/sim", shell=True)
 
-    for f_dist, f_res, log, drift, control in scenarios:
-        cmd = ["./simulator/sim", str(f_dist), str(f_res), log, str(drift), str(control)]
+    for s in scenarios:
+        f_dist, f_res, log, drift, control = s[0:5]
+        plant_drift = s[5] if len(s) > 5 else 0
+        cmd = ["./simulator/sim", str(f_dist), str(f_res), log, str(drift), str(control), str(plant_drift)]
         print(f"Running: {' '.join(cmd)}")
         subprocess.run(cmd)
 
@@ -79,6 +82,19 @@ def plot_verify():
         plt.grid(True)
         plt.savefig("verification_drift.png")
         print("Saved: verification_drift.png")
+
+    # 4. Plant Drift Adaptation
+    if os.path.exists("verify_plant_drift.csv"):
+        plt.figure(figsize=(12, 6))
+        df_pd = pd.read_csv("verify_plant_drift.csv")
+        plt.plot(df_pd['Time'], df_pd['RMS_E'], color='purple')
+        plt.axvline(x=1.5, color='green', linestyle='--', label='Control Start')
+        plt.title("Plant Resonance Drift Adaptation (20 Hz/s)")
+        plt.xlabel("Time (s)")
+        plt.ylabel("RMS Error")
+        plt.grid(True)
+        plt.savefig("verification_plant_drift.png")
+        print("Saved: verification_plant_drift.png")
 
 if __name__ == "__main__":
     run_verify()
