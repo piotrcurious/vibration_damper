@@ -76,7 +76,6 @@ void design_resonator(float f_res, float Q) {
     a2 = (1.0f - alpha) / a0;
 
     // Gain normalization - set peak gain to roughly 1.0
-    // At resonance, gain is roughly Q.
     float gain = 1.0f / Q;
     b0 *= gain; b1 *= gain; b2 *= gain;
 }
@@ -152,13 +151,15 @@ void xTaskCreatePinnedToCore(TaskFunction_t task, const char* name, uint32_t sta
 }
 
 // --- Simulation Loop ---
-void run_simulation(int steps, std::ofstream& log) {
+void run_simulation(int steps, std::ofstream& log, bool control_enabled) {
     for (int step = 0; step < steps; ++step) {
         update_plant_sim();
 
         // 4. Run Firmware Iteration (ISR)
-        if (!sysid_running) {
+        if (control_enabled && !sysid_running) {
             onTimer();
+        } else if (!control_enabled) {
+            current_dac_value = 0;
         }
 
         // Run background tasks (at ~50Hz)
@@ -170,9 +171,7 @@ void run_simulation(int steps, std::ofstream& log) {
             }
         }
 
-        if (step % 40 == 0) {
-            log << t_global << "," << current_dist << "," << current_dac_value << "," << current_adc_err << "," << v_rms_e << std::endl;
-        }
+        log << t_global << "," << current_dist << "," << current_dac_value << "," << current_adc_err << "," << v_rms_e << std::endl;
     }
 }
 
@@ -181,12 +180,14 @@ int main(int argc, char** argv) {
     float f_res = 200.0f;
     float Q = 5.0f;
     float drift = 0.0f;
+    bool control_enabled = true;
     std::string log_name = "sim_log.csv";
 
     if (argc >= 2) f_dist = std::stof(argv[1]);
     if (argc >= 3) f_res = std::stof(argv[2]);
     if (argc >= 4) log_name = argv[3];
     if (argc >= 5) drift = std::stof(argv[4]);
+    if (argc >= 6) control_enabled = (std::stoi(argv[5]) != 0);
 
     disturbance_freq = f_dist;
     drift_rate = drift;
@@ -198,17 +199,30 @@ int main(int argc, char** argv) {
     std::ofstream log(log_name);
     log << "Time,Disturbance,Actuator,Error,RMS_E" << std::endl;
 
-    std::cout << "Starting simulation: Disturbance=" << f_dist << "Hz, Resonance=" << f_res << "Hz" << std::endl;
-    run_simulation(2000, log); // 0.5 second
+    std::cout << "Starting simulation: Disturbance=" << f_dist << "Hz, Resonance=" << f_res << "Hz, Control=" << (control_enabled ? "ON" : "OFF") << std::endl;
+    run_simulation(2000, log, control_enabled); // 0.5 second
 
-    std::cout << "Running SYSID..." << std::endl;
-    identifySecondaryPath();
+    if (control_enabled) {
+        std::cout << "Running SYSID..." << std::endl;
+        identifySecondaryPath();
+    }
 
-    std::cout << "Resuming simulation with identified S_hat..." << std::endl;
-    run_simulation(4000, log); // 1 more second
+    std::cout << "Resuming simulation..." << std::endl;
+    run_simulation(8000, log, control_enabled); // 2 more seconds
 
     log.close();
     std::cout << "Simulation complete. Log written to " << log_name << std::endl;
+
+    // Save final spectrum for analysis
+    std::string spec_name = log_name.substr(0, log_name.find_last_of(".")) + "_spec.csv";
+    std::ofstream spec(spec_name);
+    spec << "Hz,Magnitude" << std::endl;
+    for (int i = 1; i < FFT_SIZE / 2; i++) {
+        float hz = i * (float)SAMPLE_RATE / FFT_SIZE;
+        spec << hz << "," << fft_spectrum[i] << std::endl;
+    }
+    spec.close();
+    std::cout << "Final spectrum written to " << spec_name << std::endl;
 
     return 0;
 }

@@ -64,13 +64,13 @@ static constexpr int   SAMPLE_RATE      = 4000;                      // Hz — c
 static constexpr int   SAMPLE_PERIOD_US = 1000000 / SAMPLE_RATE;     // µs per tick
 
 // ── Filter sizes (must be powers of 2 for bitmask-based circular buffers) ─
-static constexpr int   W_TAPS  = 64;     // Adaptive cancellation filter W length
-static constexpr int   S_TAPS  = 16;     // Secondary-path model Ŝ length
+static constexpr int   W_TAPS  = 128;    // Adaptive cancellation filter W length
+static constexpr int   S_TAPS  = 64;     // Secondary-path model Ŝ length
 
 // ── FxLMS algorithm ───────────────────────────────────────────────────────
-static constexpr float MU0             = 0.05f;    // Base step size
-static constexpr float MU_CEIL         = 0.2f;     // Absolute ceiling on μ_n
-static constexpr float LEAKAGE         = 0.9995f;  // Weights leakage to prevent drift
+static constexpr float MU0             = 0.08f;    // Base step size
+static constexpr float MU_CEIL         = 0.3f;     // Absolute ceiling on μ_n
+static constexpr float LEAKAGE         = 0.9999f;  // Weights leakage to prevent drift
 static constexpr float POWER_ALPHA     = 0.999f;   // IIR smoothing for NLMS power estimate
 static constexpr float POWER_FLOOR     = 1e-8f;    // Prevents divide-by-zero
 

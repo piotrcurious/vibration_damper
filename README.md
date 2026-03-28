@@ -22,6 +22,11 @@ The adaptive filter is capable of tracking disturbances with drifting frequencie
 
 ![Frequency Tracking](simulator/result_200_250_25.png)
 
+### Spectral Purity
+Spectral analysis confirms that the FxLMS algorithm suppresses the target tones (e.g., 150 Hz) by over 20 dB without inducing significant secondary oscillations or spectral shifts, maintaining a clean output across the 0–2 kHz bandwidth.
+
+![Spectral Purity](simulator/spectrum_comparison_150_v2.png)
+
 ## Repository Structure
 
 - `src/avd_esp32.ino`: Core firmware for the ESP32.
