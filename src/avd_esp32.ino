@@ -68,11 +68,15 @@ static constexpr int   W_TAPS  = 64;     // Adaptive cancellation filter W lengt
 static constexpr int   S_TAPS  = 16;     // Secondary-path model Ŝ length
 
 // ── FxLMS algorithm ───────────────────────────────────────────────────────
-static constexpr float MU0             = 5e-4f;    // Base step size μ₀
-static constexpr float MU_CEIL         = 1e-1f;    // Absolute ceiling on μ_n
-static constexpr float LEAKAGE         = 0.99999f; // Leaky factor: prevents weight blow-up
+static constexpr float MU0             = 0.05f;    // Base step size
+static constexpr float MU_CEIL         = 0.2f;     // Absolute ceiling on μ_n
+static constexpr float LEAKAGE         = 0.9995f;  // Weights leakage to prevent drift
 static constexpr float POWER_ALPHA     = 0.999f;   // IIR smoothing for NLMS power estimate
 static constexpr float POWER_FLOOR     = 1e-8f;    // Prevents divide-by-zero
+
+// ── Divergence Protection ────────────────────────────────────────────────
+static constexpr float DIV_THRESHOLD   = 2.5f;     // Ratio of current RMS to baseline
+static constexpr int   DIV_CHECK_MS    = 1000;     // Initial convergence window
 
 // ── DC-blocking first-order HPF: cutoff ≈ Fs·(1−α)/(2π) ─────────────────
 static constexpr float DC_ALPHA        = 0.995f;   // ≈ 3 Hz at 4 kHz
@@ -147,6 +151,8 @@ static float xf_power = POWER_FLOOR;
 
 // ── Runtime-adjustable step size ─────────────────────────────────────────
 static volatile float v_mu = MU0;
+static float         baseline_rms = 0.0f;
+static uint32_t      start_time   = 0;
 
 // ── RMS metrics  (ISR → telemetry task) ───────────────────────────────────
 static constexpr int RMS_BLOCK = SAMPLE_RATE / 10;   // 100 ms block
@@ -252,66 +258,70 @@ void IRAM_ATTR onTimer() {
 // ════════════════════════════════════════════════════════════════════════════
 //  SECONDARY PATH IDENTIFICATION (SYSID)
 //
-//  Injects band-limited white noise through the actuator, captures the
+//  Injects a logarithmic chirp through the actuator, captures the
 //  response at the error sensor, and estimates Ŝ via cross-correlation.
+//  The chirp provides better SNR across the bandwidth than white noise.
 //
-//  Call with no external vibration present. Takes ~0.5 s.
+//  Call with no external vibration present. Takes ~1.2 s.
 //  Resets adaptive weights W after completion (Ŝ has changed).
 // ════════════════════════════════════════════════════════════════════════════
 static void identifySecondaryPath() {
-    constexpr int   LEN = 1024;
-    constexpr float AMP = 0.08f;   // Low amplitude — avoids mechanical saturation
+    constexpr int   LEN = 4096;    // 1 second at 4 kHz
+    constexpr float AMP = 0.15f;   // Higher amplitude for chirp
+    constexpr float F0  = 20.0f;   // Start freq
+    constexpr float F1  = 1800.0f; // End freq
 
-    Serial.println("[SYSID] Starting — no external vibration, actuator connected");
+    Serial.println("[SYSID] Starting Chirp Sweep (20-1800 Hz)...");
     sysid_running = true;
-    delay(60);   // Let ISR flush its current buffers
+    delay(100);
 
-    // Probe and response arrays (static to avoid large stack allocation)
     static float probe[LEN], capture[LEN];
 
-    // Generate white noise probe
-    for (int i = 0; i < LEN; i++) {
-        probe[i] = AMP * (((int)(esp_random() % 2000) - 1000) / 1000.0f);
+    // Generate Log-Chirp
+    const float log_f = logf(F1 / F0);
+    for (int n = 0; n < LEN; n++) {
+        float t = (float)n / SAMPLE_RATE;
+        float phi = 2.0f * PI * F0 * (LEN / (log_f * SAMPLE_RATE)) * (expf(t * log_f * SAMPLE_RATE / LEN) - 1.0f);
+        probe[n] = AMP * sinf(phi);
     }
 
-    // Inject through DAC, capture from error ADC at SAMPLE_RATE
+    // Inject and Capture
     for (int i = 0; i < LEN; i++) {
         const int dv = DAC_MIDPOINT + (int)(probe[i] * DAC_SCALE);
         dac_output_voltage(DAC_ACT, (uint8_t)(dv < 0 ? 0 : dv > 255 ? 255 : dv));
         delayMicroseconds(SAMPLE_PERIOD_US);
         capture[i] = (adc1_get_raw(ADC1_CHANNEL_7) - ADC_MIDPOINT) * ADC_NORM;
     }
-    dac_output_voltage(DAC_ACT, DAC_MIDPOINT);   // Return to mid-rail
+    dac_output_voltage(DAC_ACT, DAC_MIDPOINT);
 
-    // Cross-correlation: Rxy[k] = (1/N) Σ probe[n] · capture[n+k]
-    // This is the MMSE estimate of the FIR impulse response h[k] such that
-    // capture[n] ≈ Σ h[k] · probe[n-k]  (assumes probe is white)
+    // Cross-correlation
     float peak = 0.0f;
-    const int N = LEN - S_TAPS;
+    const int N_CORR = LEN - S_TAPS;
     for (int k = 0; k < S_TAPS; k++) {
         float acc = 0.0f;
-        for (int n = 0; n < N; n++) acc += probe[n] * capture[n + k];
-        s_hat[k] = acc / N;
+        for (int n = 0; n < N_CORR; n++) acc += probe[n] * capture[n + k];
+        s_hat[k] = acc / N_CORR;
         if (fabsf(s_hat[k]) > peak) peak = fabsf(s_hat[k]);
     }
 
-    if (peak > 1e-5f) {
-        for (int k = 0; k < S_TAPS; k++) s_hat[k] /= peak;   // Normalise to unit peak
-        Serial.print("[SYSID] Ŝ: ");
-        for (int k = 0; k < S_TAPS; k++) Serial.printf("%.4f ", s_hat[k]);
-        Serial.println("\n[SYSID] Identified OK");
+    if (peak > 1e-4f) {
+        for (int k = 0; k < S_TAPS; k++) s_hat[k] /= peak;
+        Serial.print("[SYSID] Ŝ Identified OK. Coefficients: ");
+        for (int k = 0; k < S_TAPS; k++) Serial.printf("%.3f ", s_hat[k]);
+        Serial.println("");
     } else {
-        // Fallback: pure delay model — better than nothing
         memset(s_hat, 0, sizeof(s_hat));
         s_hat[S_TAPS / 2] = 1.0f;
-        Serial.println("[SYSID] SNR too low — using delay model. Check wiring/amplitude.");
+        Serial.println("[SYSID] Warning: Low SNR. Using unit delay fallback.");
     }
 
-    // Reset W (Ŝ changed → old weights optimised for wrong model)
+    // Reset W
     portENTER_CRITICAL(&isr_mux);
     memset(w, 0, sizeof(w));
     dl_x.reset(); dl_xf.reset(); dl_s.reset();
     xf_power = POWER_FLOOR;
+    baseline_rms = 0.0f;
+    start_time = millis();
     portEXIT_CRITICAL(&isr_mux);
 
     sysid_running = false;
@@ -327,8 +337,10 @@ static void identifySecondaryPath() {
 static double fft_re[FFT_SIZE], fft_im[FFT_SIZE];
 
 static void fftTask(void*) {
-    arduinoFFT fft;
+    static arduinoFFT fft;
+#ifndef SIMULATOR
     while (true) {
+#endif
         if (fft_ready) {
             fft_ready = false;
             // Read the buffer NOT currently being written by the ISR
@@ -343,8 +355,10 @@ static void fftTask(void*) {
             for (int i = 0; i < FFT_SIZE / 2; i++)
                 fft_spectrum[i] = (float)(fft_re[i] / norm);
         }
+#ifndef SIMULATOR
         vTaskDelay(pdMS_TO_TICKS(20));
     }
+#endif
 }
 
 
@@ -354,17 +368,35 @@ static void fftTask(void*) {
 //  Output format is CSV-friendly for live plotting (Python, Serial Plotter).
 // ════════════════════════════════════════════════════════════════════════════
 static void telemTask(void*) {
-    const int PERIOD_MS   = 1000 / TELEM_HZ;
-    const int PEAK_STRIDE = TELEM_HZ / PEAK_HZ;
-    int       peak_tick   = 0;
+    static const int PERIOD_MS   = 1000 / TELEM_HZ;
+    static const int PEAK_STRIDE = TELEM_HZ / PEAK_HZ;
+    static int       peak_tick   = 0;
 
+#ifndef SIMULATOR
     while (true) {
         vTaskDelay(pdMS_TO_TICKS(PERIOD_MS));
+#endif
 
         if (v_rms_rdy) {
             v_rms_rdy = false;
-            // Attenuation in dB relative to error-without-cancellation is visible as
-            // RMS_E decreasing over time; RMS_Y is the actuator output power.
+
+            // Divergence Detection Logic
+            if (baseline_rms < 1e-6f && millis() - start_time > DIV_CHECK_MS) {
+                baseline_rms = v_rms_e;
+                Serial.printf("[PROT] Baseline RMS established: %.5f\n", baseline_rms);
+            } else if (baseline_rms > 0.0f && v_rms_e > baseline_rms * DIV_THRESHOLD) {
+                Serial.printf("[PROT] Divergence detected! RMS: %.5f > %.5f. Reducing MU.\n", v_rms_e, baseline_rms * DIV_THRESHOLD);
+                v_mu *= 0.5f;
+                // Reset weights
+                portENTER_CRITICAL(&isr_mux);
+                memset(w, 0, sizeof(w));
+                dl_x.reset(); dl_xf.reset(); dl_s.reset();
+                xf_power = POWER_FLOOR;
+                portEXIT_CRITICAL(&isr_mux);
+                baseline_rms = 0.0f; // Re-establish baseline
+                start_time = millis();
+            }
+
             Serial.printf("RMS_E:%.5f RMS_Y:%.5f MU:%.2e\n",
                           v_rms_e, v_rms_y, v_mu);
         }
@@ -379,7 +411,9 @@ static void telemTask(void*) {
             const float peak_hz = peak_bin * (float)SAMPLE_RATE / FFT_SIZE;
             Serial.printf("PEAK: %.1f Hz  mag=%.5f\n", peak_hz, peak_mag);
         }
+#ifndef SIMULATOR
     }
+#endif
 }
 
 
@@ -489,14 +523,13 @@ void setup() {
     dac_output_voltage(DAC_ACT, DAC_MIDPOINT);
 
     // ── Default secondary path: pure delay of S_TAPS/2 samples ───────────
-    // This is a placeholder that will work acceptably for a single pole
-    // mechanical system. Run SYSID for proper identification.
     memset(s_hat, 0, sizeof(s_hat));
     s_hat[S_TAPS / 2] = 1.0f;
     Serial.println("[INIT] Ŝ initialised to unit delay (run SYSID for accuracy).");
 
-    // ── Delay lines ───────────────────────────────────────────────────────
+    // ── Delay lines & Baseline ───────────────────────────────────────────
     dl_x.reset(); dl_xf.reset(); dl_s.reset();
+    start_time = millis();
 
     // ── Background tasks pinned to Core 0 (leaves Core 1 for control) ────
     xTaskCreatePinnedToCore(fftTask,  "FFT",   4096, nullptr, 1, nullptr, 0);
