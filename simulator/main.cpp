@@ -199,13 +199,13 @@ int main(int argc, char** argv) {
     log << "Time,Disturbance,Actuator,Error,RMS_E" << std::endl;
 
     std::cout << "Starting simulation: Disturbance=" << f_dist << "Hz, Resonance=" << f_res << "Hz" << std::endl;
-    run_simulation(4000, log); // 1 second
+    run_simulation(2000, log); // 0.5 second
 
     std::cout << "Running SYSID..." << std::endl;
     identifySecondaryPath();
 
     std::cout << "Resuming simulation with identified S_hat..." << std::endl;
-    run_simulation(8000, log); // 2 more seconds
+    run_simulation(4000, log); // 1 more second
 
     log.close();
     std::cout << "Simulation complete. Log written to " << log_name << std::endl;
