@@ -12,11 +12,8 @@ def run_scenario(f_dist, f_res, drift=0):
 def main():
     # Define scenarios (f_dist, f_res, drift)
     scenarios = [
-        (100, 200, 0),
-        (250, 300, 0),
-        (400, 100, 0), # Resonance below frequency
-        (600, 600, 0), # Frequency at resonance
-        (200, 250, 25), # Frequency drift 25 Hz/s
+        (150, 200, 0),   # Standard Case
+        (200, 250, 25),  # Frequency drift 25 Hz/s
     ]
 
     # Compile
