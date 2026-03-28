@@ -53,6 +53,9 @@
 #include <driver/adc.h>
 #include <driver/dac.h>
 #include <arduinoFFT.h>   // v1.x API
+#include <vector>
+#include <algorithm>
+#include <cmath>
 
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -64,13 +67,15 @@ static constexpr int   SAMPLE_RATE      = 4000;                      // Hz — c
 static constexpr int   SAMPLE_PERIOD_US = 1000000 / SAMPLE_RATE;     // µs per tick
 
 // ── Filter sizes (must be powers of 2 for bitmask-based circular buffers) ─
-static constexpr int   W_TAPS  = 128;    // Adaptive cancellation filter W length
+static constexpr int   W_TAPS  = 64;     // Reduced FIR size (now used for residual broadband)
 static constexpr int   S_TAPS  = 64;     // Secondary-path model Ŝ length
+static constexpr int   NUM_SOGI = 6;     // Number of parallel SOGI resonators
 
 // ── FxLMS algorithm ───────────────────────────────────────────────────────
-static constexpr float MU0             = 0.08f;    // Base step size
+static constexpr float MU0             = 0.01f;    // FIR base step size
+static constexpr float MU_SOGI         = 0.03f;    // SOGI step size
 static constexpr float MU_CEIL         = 0.3f;     // Absolute ceiling on μ_n
-static constexpr float LEAKAGE         = 0.9999f;  // Weights leakage to prevent drift
+static constexpr float LEAKAGE         = 0.9995f;  // Weights leakage to prevent drift
 static constexpr float POWER_ALPHA     = 0.999f;   // IIR smoothing for NLMS power estimate
 static constexpr float POWER_FLOOR     = 1e-8f;    // Prevents divide-by-zero
 
@@ -95,6 +100,81 @@ static constexpr int   TELEM_HZ        = 50;    // Serial CSV rate
 static constexpr int   PEAK_HZ         = 4;     // Peak-frequency report rate
 static constexpr int   FFT_SIZE        = 512;   // Error-signal spectrum window
 
+
+// ════════════════════════════════════════════════════════════════════════════
+//  SOGI-QSG (Second-Order Generalized Integrator - Quadrature Signal Generator)
+//  Acts as a bandpass filter that provides in-phase and quadrature components.
+// ════════════════════════════════════════════════════════════════════════════
+struct SogiQSG {
+    float x1, x2;       // Delay line for input
+    float us1, us2;     // Delay line for BP output
+    float uc1, uc2;     // Delay line for QP output
+    float k = 0.1f;     // Gain (damping) - lower is narrower
+    float f_center;     // Hz
+    float b0, a1, a2;   // Coefficients for BP output (u_s)
+    float qb0, qb1, qb2;// Coefficients for QP output (u_c)
+
+    // Secondary path compensation at f_center
+    float s_real, s_imag;
+    bool  pending_update = false;
+    float next_f = 0;
+
+    // Adaptive weights for this resonator
+    float w_s, w_c;
+
+    void reset() {
+        x1 = x2 = us1 = us2 = uc1 = uc2 = 0;
+        w_s = w_c = 0;
+        f_center = 0;
+        pending_update = false;
+    }
+
+    // Initialize coefficients using Tustin transform
+    void updateFreq(float freq, float fs, const float* s_hat_coeffs) {
+        if (freq < 10.0f) { f_center = 0; return; }
+        f_center = freq;
+        float wc = 2.0f * PI * freq;
+        float T = 1.0f / fs;
+
+        // Tustin: s -> (2/T) * (z-1)/(z+1)
+        float theta = wc * T / 2.0f;
+        float th2 = theta * theta;
+        float k_th = k * theta;
+        float den = 1.0f + k_th + th2;
+
+        // Bandpass (D(s) = k*wc*s / (s^2 + k*wc*s + wc^2))
+        b0 = k_th / den;
+        // b1 = 0, b2 = -b0
+        a1 = 2.0f * (th2 - 1.0f) / den;
+        a2 = (1.0f - k_th + th2) / den;
+
+        // Quadrature (Q(s) = k*wc^2 / (s^2 + k*wc*s + wc^2))
+        qb0 = k * th2 / den; // Q(z) = k*th^2*(1+z^-1)^2 / den(z)
+        qb1 = 2.0f * qb0;
+        qb2 = qb0;
+
+        // Compute Secondary Path Frequency Response at wc
+        // S(wc) = sum( s_hat[k] * exp(-j * wc * k * T) )
+        s_real = 0; s_imag = 0;
+        for (int i = 0; i < S_TAPS; i++) {
+            float angle = wc * i * T;
+            s_real += s_hat_coeffs[i] * cosf(angle);
+            s_imag -= s_hat_coeffs[i] * sinf(angle);
+        }
+    }
+
+    // Process one sample and return [u_s, u_c]
+    IRAM_ATTR void process(float x, float& u_s, float& u_c) {
+        if (f_center < 1.0f) { u_s = u_c = 0; return; }
+
+        u_s = b0*(x - x2) - a1*us1 - a2*us2;
+        u_c = qb0*x + qb1*x1 + qb2*x2 - a1*uc1 - a2*uc2;
+
+        x2 = x1; x1 = x;
+        us2 = us1; us1 = u_s;
+        uc2 = uc1; uc1 = u_c;
+    }
+};
 
 // ════════════════════════════════════════════════════════════════════════════
 //  CIRCULAR DELAY LINE
@@ -142,6 +222,10 @@ static float            s_hat[S_TAPS]= {0};   // Secondary path estimate Ŝ
 static DelayLine<W_TAPS> dl_x;    // Reference x[n] → FIR W
 static DelayLine<W_TAPS> dl_xf;   // Filtered reference x'[n] → LMS update
 static DelayLine<S_TAPS> dl_s;    // Reference x[n] → FIR Ŝ (produces x'[n])
+
+// ── SOGI Bank ─────────────────────────────────────────────────────────────
+static SogiQSG sogi_bank[NUM_SOGI];
+static float   sogi_freqs[NUM_SOGI] = {0};
 
 // ── DC blocking ───────────────────────────────────────────────────────────
 static float dc_ref = 0.0f, dc_err = 0.0f;
@@ -201,28 +285,59 @@ void IRAM_ATTR onTimer() {
         dc_err        = lp_new;
     }
 
-    // ── 3. Filter reference through secondary path estimate Ŝ ─────────────
-    //   x'[n] = Ŝ * x[n]  — used in weight update, not in output path
-    dl_s.push(x_n);
-    const float xf_n = dl_s.dot(s_hat);
+    // ── 3. Hybrid Output Synthesis (SOGI Bank + FIR) ──────────────────────
+    float y_n = 0;
 
-    // ── 4. Compute cancellation output  y[n] = W^T · x ───────────────────
+    // a. SOGI Tonal Cancellation
+    for (int i = 0; i < NUM_SOGI; i++) {
+        // Safe frequency update from background task
+        if (sogi_bank[i].pending_update) {
+            sogi_bank[i].updateFreq(sogi_bank[i].next_f, SAMPLE_RATE, s_hat);
+            sogi_bank[i].pending_update = false;
+        }
+
+        if (sogi_bank[i].f_center < 10.0f) continue;
+
+        float u_s, u_c;
+        sogi_bank[i].process(x_n, u_s, u_c);
+
+        // Output contribution: y[n] = Σ (w_s*u_s + w_c*u_c)
+        y_n += sogi_bank[i].w_s * u_s + sogi_bank[i].w_c * u_c;
+
+        // Adaptive Weight Update (FxLMS)
+        // Steady-state Filtered-x signals for a sinusoid at f_center:
+        // u_s is cos-like, u_c is sin-like.
+        // Filtered-x: u_sf = u_s*R - u_c*I,  u_cf = u_c*R + u_s*I
+        float u_sf = sogi_bank[i].s_real * u_s - sogi_bank[i].s_imag * u_c;
+        float u_cf = sogi_bank[i].s_real * u_c + sogi_bank[i].s_imag * u_s;
+
+        // Normalization for SOGI (based on input power)
+        float sogi_mu = MU_SOGI / (0.1f + u_sf*u_sf + u_cf*u_cf);
+
+        // Update weights
+        sogi_bank[i].w_s = LEAKAGE * sogi_bank[i].w_s - sogi_mu * e_n * u_sf;
+        sogi_bank[i].w_c = LEAKAGE * sogi_bank[i].w_c - sogi_mu * e_n * u_cf;
+    }
+
+    // b. Broadband FIR Contribution
     dl_x.push(x_n);
-    float y_n = dl_x.dot(w);
+    y_n += dl_x.dot(w);
 
     // Clip to ±1.0 (hard limiter; protects actuator)
     if      (y_n >  1.0f) y_n =  1.0f;
     else if (y_n < -1.0f) y_n = -1.0f;
 
-    // ── 5. Drive actuator via ESP32 DAC (GPIO25) ──────────────────────────
-    //   Map ±1.0 → [1, 255] DAC counts, mid-rail = 128
+    // ── 4. Drive actuator ─────────────────────────────────────────────────
     const int dac_out = DAC_MIDPOINT + (int)(y_n * DAC_SCALE);
     dac_output_voltage(DAC_ACT, (uint8_t)(dac_out < 0 ? 0 : dac_out > 255 ? 255 : dac_out));
 
-    // ── 6. NLMS weight update: w[i] ← λ·w[i] − μ_n · e[n] · x'[n−i] ────
+    // ── 5. Weight Update (FxLMS) for FIR ──────────────────────────────────
+    dl_s.push(x_n);
+    const float xf_n = dl_s.dot(s_hat);
     dl_xf.push(xf_n);
-    xf_power = POWER_ALPHA * xf_power + (1.0f - POWER_ALPHA) * xf_n * xf_n;
 
+    // FIR Update (Normalized LMS)
+    xf_power = POWER_ALPHA * xf_power + (1.0f - POWER_ALPHA) * xf_n * xf_n;
     float mu_n = v_mu / (POWER_FLOOR + xf_power * W_TAPS);
     if (mu_n > MU_CEIL) mu_n = MU_CEIL;
 
@@ -354,6 +469,32 @@ static void fftTask(void*) {
             const float norm = (float)(FFT_SIZE / 2);
             for (int i = 0; i < FFT_SIZE / 2; i++)
                 fft_spectrum[i] = (float)(fft_re[i] / norm);
+
+            // Tonal Inference: Find dominant peaks and update SOGI bank
+            // 1. Find local peaks in the spectrum
+            struct Peak { int bin; float mag; };
+            std::vector<Peak> peaks;
+            for (int i = 5; i < FFT_SIZE / 2 - 5; i++) { // Ignore DC and high-freq noise
+                if (fft_spectrum[i] > fft_spectrum[i-1] && fft_spectrum[i] > fft_spectrum[i+1] && fft_spectrum[i] > 0.005f) {
+                    peaks.push_back({i, fft_spectrum[i]});
+                }
+            }
+            std::sort(peaks.begin(), peaks.end(), [](const Peak& a, const Peak& b) { return a.mag > b.mag; });
+
+            // 2. Assign top 6 peaks to SOGI bank
+            for (int i = 0; i < NUM_SOGI; i++) {
+                if (i < (int)peaks.size()) {
+                    float freq = peaks[i].bin * (float)SAMPLE_RATE / FFT_SIZE;
+                    // If frequency has moved significantly (> 4 Hz), schedule update
+                    if (fabsf(freq - sogi_bank[i].f_center) > 4.0f && !sogi_bank[i].pending_update) {
+                        sogi_bank[i].next_f = freq;
+                        sogi_bank[i].pending_update = true;
+                    }
+                } else if (!sogi_bank[i].pending_update) {
+                    sogi_bank[i].next_f = 0;
+                    sogi_bank[i].pending_update = true;
+                }
+            }
         }
 #ifndef SIMULATOR
         vTaskDelay(pdMS_TO_TICKS(20));
@@ -443,8 +584,9 @@ static void parseCmd(const String& raw) {
         memset(w, 0, sizeof(w));
         dl_x.reset(); dl_xf.reset(); dl_s.reset();
         xf_power = POWER_FLOOR;
+        for (int i = 0; i < NUM_SOGI; i++) sogi_bank[i].reset();
         portEXIT_CRITICAL(&isr_mux);
-        Serial.println("[CMD] Filter weights W reset to zero.");
+        Serial.println("[CMD] Filter weights and SOGI bank reset.");
 
     } else if (cmd == "SYSID") {
         // Estimate secondary path Ŝ (actuator → error sensor impulse response).
@@ -504,7 +646,7 @@ void setup() {
     Serial.println(
         "\n╔══════════════════════════════════════════════╗\n"
         "║   ESP32 Active Vibration Damping System      ║\n"
-        "║   FxLMS | 4 kHz | W=64 taps | S=16 taps     ║\n"
+        "║   Hybrid SOGI-FxLMS | 4 kHz                  ║\n"
         "╚══════════════════════════════════════════════╝"
     );
 

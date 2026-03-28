@@ -2,13 +2,13 @@
 #include "Arduino.h"
 #include "driver/adc.h"
 #include "driver/dac.h"
-#include "arduinoFFT.h"
 #include "freertos/FreeRTOS.h"
 #include "driver/timer.h"
 #include <iostream>
 #include <vector>
 #include <cmath>
 #include <random>
+#include <algorithm>
 #include <algorithm>
 #include <fstream>
 #include <string>
@@ -208,7 +208,7 @@ int main(int argc, char** argv) {
     }
 
     std::cout << "Resuming simulation..." << std::endl;
-    run_simulation(8000, log, control_enabled); // 2 more seconds
+    run_simulation(20000, log, control_enabled); // 5 more seconds
 
     log.close();
     std::cout << "Simulation complete. Log written to " << log_name << std::endl;

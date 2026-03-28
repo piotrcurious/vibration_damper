@@ -5,27 +5,28 @@ This repository contains a professional-grade implementation of an Active Vibrat
 ## Features
 
 - **Adaptive Control**: Uses a Normalized FxLMS (NLMS) algorithm that adapts to changing mechanical conditions and signal powers.
+- **Hybrid SOGI-FxLMS**: Combines a 64-tap broadband FIR with a bank of 6 **Second-Order Generalized Integrators (SOGI)** for high-selectivity tonal cancellation (>30 dB suppression).
 - **Log-Chirp System ID**: Built-in secondary path identification using logarithmic chirp sweeps (20 Hz - 1800 Hz) for high-accuracy plant modeling.
 - **Divergence Protection**: Real-time monitoring of RMS error with automatic step-size scaling and weight resetting to prevent instability.
-- **Physics Simulator**: A full C++ simulation environment to validate firmware logic against resonant mechanical models before hardware deployment.
+- **Physics Simulator**: A full C++ simulation environment with functional **Cooley-Tukey FFT** logic to validate firmware spectral analysis on host machines.
 - **High Performance**: Optimized ISR-based control loop running at **4 kHz** on Core 1, with telemetry and FFT diagnostics on Core 0.
 
 ## Performance
 
-### Standard Convergence
-The system identifies the secondary path (actuator-to-sensor delay and resonance) and quickly converges to minimize the error signal.
+### Hybrid SOGI-FxLMS Convergence
+The system identifies the secondary path and concurrently tunes multiple SOGI resonators to the dominant spectral peaks. This hybrid approach provides significantly faster and deeper cancellation of harmonic tones than traditional FIR-only FxLMS.
 
-![Standard Convergence](simulator/result_150_200_0.png)
+![Hybrid Convergence](verification_convergence.png)
 
 ### Frequency Tracking
-The adaptive filter is capable of tracking disturbances with drifting frequencies (e.g., 25 Hz/s), ensuring continuous damping in dynamic environments.
+The SOGI bank dynamically tracks drifting disturbances (up to 15 Hz/s) using real-time spectral peak detection, ensuring high-Q damping even as the excitation frequency shifts.
 
-![Frequency Tracking](simulator/result_200_250_25.png)
+![Drift Tracking](verification_drift.png)
 
-### Spectral Purity
-Spectral analysis confirms that the FxLMS algorithm suppresses the target tones (e.g., 150 Hz) by over 20 dB without inducing significant secondary oscillations or spectral shifts, maintaining a clean output across the 0–2 kHz bandwidth.
+### Spectral Performance
+Spectral analysis confirms that the Hybrid architecture achieves >30 dB suppression of the primary tone and its harmonics, while the broadband FIR component handles residual noise.
 
-![Spectral Purity](simulator/spectrum_comparison_150_v2.png)
+![Spectral Performance](verification_spectrum.png)
 
 ## Repository Structure
 
