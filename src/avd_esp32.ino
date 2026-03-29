@@ -72,11 +72,11 @@ static constexpr int   S_TAPS  = 64;     // Secondary-path model Ŝ length
 static constexpr int   NUM_SOGI = 6;     // Number of parallel SOGI resonators
 
 // ── FxLMS algorithm ───────────────────────────────────────────────────────
-static constexpr float MU0             = 0.01f;    // FIR base step size
-static constexpr float MU_SOGI         = 0.03f;    // SOGI step size
+static constexpr float MU0             = 0.05f;    // FIR base step size
+static constexpr float MU_SOGI         = 0.15f;    // SOGI step size
 static constexpr float MU_S_HAT        = 0.005f;   // ASPM step size (slow and steady)
 static constexpr float MU_CEIL         = 0.3f;     // Absolute ceiling on μ_n
-static constexpr float LEAKAGE         = 0.9995f;  // Weights leakage to prevent drift
+static constexpr float LEAKAGE         = 0.9999f;  // Weights leakage to prevent drift
 static constexpr float POWER_ALPHA     = 0.999f;   // IIR smoothing for NLMS power estimate
 static constexpr float POWER_FLOOR     = 1e-8f;    // Prevents divide-by-zero
 
@@ -129,6 +129,7 @@ struct SogiQSG {
         w_s = w_c = 0;
         f_center = 0;
         pending_update = false;
+        pending_model_update = false;
     }
 
     // Initialize coefficients using Tustin transform
@@ -234,6 +235,7 @@ static float dc_ref = 0.0f, dc_err = 0.0f;
 
 // ── ASPM (Adaptive Secondary Path Modeling) ──────────────────────────────
 static bool           aspm_enabled = true;
+static bool           control_active = true;
 static float          dither_y     = 0.0f;
 static DelayLine<S_TAPS> dl_y;      // DAC output y[n] → ASPM Ŝ update
 
@@ -295,6 +297,7 @@ void IRAM_ATTR onTimer() {
     // ── 3. Hybrid Output Synthesis (SOGI Bank + FIR) ──────────────────────
     float y_n = 0;
 
+    if (control_active) {
     // a. SOGI Tonal Cancellation
     static int aspm_stride_idx = 0;
     aspm_stride_idx = (aspm_stride_idx + 1) % 128; // Every ~30 ms, flag SOGI to re-eval plant response
@@ -313,7 +316,7 @@ void IRAM_ATTR onTimer() {
         sogi_bank[i].process(x_n, u_s, u_c);
 
         // Output contribution: y[n] = Σ (w_s*u_s + w_c*u_c)
-        y_n += sogi_bank[i].w_s * u_s + sogi_bank[i].w_c * u_c;
+        y_n -= (sogi_bank[i].w_s * u_s + sogi_bank[i].w_c * u_c); // Output MUST cancel disturbance
 
         // Adaptive Weight Update (FxLMS)
         // Steady-state Filtered-x signals for a sinusoid at f_center:
@@ -325,14 +328,25 @@ void IRAM_ATTR onTimer() {
         // Normalization for SOGI (based on input power)
         float sogi_mu = MU_SOGI / (0.1f + u_sf*u_sf + u_cf*u_cf);
 
-        // Update weights
-        sogi_bank[i].w_s = LEAKAGE * sogi_bank[i].w_s - sogi_mu * e_n * u_sf;
-        sogi_bank[i].w_c = LEAKAGE * sogi_bank[i].w_c - sogi_mu * e_n * u_cf;
+        // Update weights (Gradient Descent)
+        // Weight update direction should be MINIMIZING e^2.
+        // e = d + S*y = d - S*(W*U).  de/dW = -S*U
+        // W = W - mu * e * de/dW = W + mu * e * (S*U)
+        sogi_bank[i].w_s = LEAKAGE * sogi_bank[i].w_s + sogi_mu * e_n * u_sf;
+        sogi_bank[i].w_c = LEAKAGE * sogi_bank[i].w_c + sogi_mu * e_n * u_cf;
+
+        // Anti-windup / Limiter for SOGI weights
+        const float W_MAX = 5.0f;
+        if (sogi_bank[i].w_s >  W_MAX) sogi_bank[i].w_s =  W_MAX;
+        if (sogi_bank[i].w_s < -W_MAX) sogi_bank[i].w_s = -W_MAX;
+        if (sogi_bank[i].w_c >  W_MAX) sogi_bank[i].w_c =  W_MAX;
+        if (sogi_bank[i].w_c < -W_MAX) sogi_bank[i].w_c = -W_MAX;
     }
 
     // b. Broadband FIR Contribution
     dl_x.push(x_n);
-    y_n += dl_x.dot(w);
+    y_n -= dl_x.dot(w); // Subtract to cancel
+    }
 
     // ── 3.5. Inject ASPM Dither (low-level white noise) ───────────────────
     if (aspm_enabled) {
@@ -356,7 +370,7 @@ void IRAM_ATTR onTimer() {
     const float xf_n = dl_s.dot(s_hat);
     dl_xf.push(xf_n);
 
-    // ── 6. Adaptive Secondary Path Modeling (ASPM) ───────────────────────
+    if (control_active) {
     // We update Ŝ[n] to minimize E[ (e[n] - Ŝ * y[n])^2 ]
     // This allows tracking mechanical changes during runtime.
     if (aspm_enabled) {
@@ -376,7 +390,8 @@ void IRAM_ATTR onTimer() {
     if (mu_n > MU_CEIL) mu_n = MU_CEIL;
 
     for (int i = 0; i < W_TAPS; i++) {
-        w[i] = LEAKAGE * w[i] - mu_n * e_n * dl_xf.tap(i);
+        w[i] = LEAKAGE * w[i] + mu_n * e_n * dl_xf.tap(i);
+    }
     }
 
     // ── 7. RMS accumulation (100 ms block) ────────────────────────────────
@@ -638,6 +653,10 @@ static void parseCmd(const String& raw) {
     } else if (cmd.startsWith("ASPM ")) {
         aspm_enabled = (cmd.substring(5).toInt() != 0);
         Serial.printf("[CMD] ASPM = %s\n", aspm_enabled ? "ON" : "OFF");
+
+    } else if (cmd.startsWith("CTRL ")) {
+        control_active = (cmd.substring(5).toInt() != 0);
+        Serial.printf("[CMD] Control = %s\n", control_active ? "ON" : "OFF");
 
     } else if (cmd == "WEIGHTS") {
         // Dump all W coefficients — useful for offline analysis.

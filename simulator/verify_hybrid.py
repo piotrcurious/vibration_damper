@@ -40,10 +40,10 @@ def calculate_metrics(log_file):
         if window.empty: return 1.0
         return np.sqrt((window['Error']**2).mean())
 
-    # Initial state (before SYSID)
-    initial = df[(df['Time'] < 0.45)]
-    # Steady state (last 2 seconds of simulation)
-    steady_state = df[df['Time'] > (df['Time'].max() - 2.0)]
+    # Initial state (Baseline phase: 0.1s to 0.4s to avoid RMS estimator startup)
+    initial = df[(df['Time'] > 0.1) & (df['Time'] < 0.4)]
+    # Steady state (last 1.5 seconds of simulation)
+    steady_state = df[df['Time'] > (df['Time'].max() - 1.5)]
 
     rms_initial = get_rms(initial)
     rms_final = get_rms(steady_state)

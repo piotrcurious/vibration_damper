@@ -251,7 +251,8 @@ int main(int argc, char** argv) {
     std::cout << "Starting simulation: Disturbance=" << f_dist << "Hz, Resonance=" << f_res << "Hz, Control=" << (control_enabled ? "ON" : "OFF") << std::endl;
 
     // Phase 1: Baseline (No Control)
-    run_simulation(2000, log, false); // 0.5 second
+    parseCmd("CTRL 0");
+    run_simulation(2000, log, true); // 0.5 second
 
     // Phase 2: Calibration (SYSID)
     if (control_enabled) {
@@ -261,7 +262,8 @@ int main(int argc, char** argv) {
 
     // Phase 3: Active Control
     std::cout << "Resuming simulation with Active Control..." << std::endl;
-    run_simulation(20000, log, control_enabled); // 5 more seconds
+    parseCmd("CTRL 1");
+    run_simulation(20000, log, true); // 5 more seconds
 
     log.close();
     std::cout << "Simulation complete. Log written to " << log_name << std::endl;
