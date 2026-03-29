@@ -34,6 +34,8 @@ float current_dac_value = 0; // -1.0 to 1.0
 float current_adc_ref = 0;
 float current_adc_err = 0;
 float current_dist = 0;
+float noise_level = 0.01f;
+float shock_timer = 0;
 
 // Update the plant simulation at each time step
 void update_plant_sim() {
@@ -74,6 +76,18 @@ void update_plant_sim() {
     // 1. Generate Disturbance (Multi-tone with drift)
     current_dist = 0.5f * sin(2.0f * PI * f_now1 * t) +
                  0.2f * sin(2.0f * PI * f_now2 * t + 0.5);
+
+    // Add broadband noise
+    current_dist += noise_level * ((float)rand() / RAND_MAX - 0.5f);
+
+    // Add impulsive shocks (every 1.5 seconds, if enabled via noise_level > 0.1)
+    if (noise_level > 0.1f) {
+        shock_timer += DT;
+        if (shock_timer > 1.5f) {
+            current_dist += 1.0f; // Brief high-amplitude impulse
+            if (shock_timer > 1.52f) shock_timer = 0;
+        }
+    }
 
     current_adc_ref = current_dist + 0.01f * ((float)rand() / RAND_MAX - 0.5f);
 
@@ -201,7 +215,10 @@ void run_simulation(int steps, std::ofstream& log, bool control_enabled) {
             }
         }
 
-        log << t_global << "," << current_dist << "," << current_dac_value << "," << current_adc_err << "," << v_rms_e << std::endl;
+        log << t_global << "," << current_dist << "," << current_dac_value << "," << current_adc_err << "," << v_rms_e;
+        // Log SOGI weights for resonator 0
+        log << "," << sogi_bank[0].w_s << "," << sogi_bank[0].w_c;
+        log << std::endl;
     }
 }
 
@@ -219,6 +236,7 @@ int main(int argc, char** argv) {
     if (argc >= 5) drift = std::stof(argv[4]);
     if (argc >= 6) control_enabled = (std::stoi(argv[5]) != 0);
     if (argc >= 7) plant_drift_rate = std::stof(argv[6]);
+    if (argc >= 8) noise_level = std::stof(argv[7]);
 
     disturbance_freq = f_dist;
     drift_rate = drift;
@@ -228,12 +246,13 @@ int main(int argc, char** argv) {
     setup();
 
     std::ofstream log(log_name);
-    log << "Time,Disturbance,Actuator,Error,RMS_E" << std::endl;
+    log << "Time,Disturbance,Actuator,Error,RMS_E,W_S,W_C" << std::endl;
 
     std::cout << "Starting simulation: Disturbance=" << f_dist << "Hz, Resonance=" << f_res << "Hz, Control=" << (control_enabled ? "ON" : "OFF") << std::endl;
 
     // Phase 1: Baseline (No Control)
-    run_simulation(2000, log, false); // 0.5 second
+    parseCmd("CTRL 0");
+    run_simulation(2000, log, true); // 0.5 second
 
     // Phase 2: Calibration (SYSID)
     if (control_enabled) {
@@ -243,10 +262,19 @@ int main(int argc, char** argv) {
 
     // Phase 3: Active Control
     std::cout << "Resuming simulation with Active Control..." << std::endl;
-    run_simulation(20000, log, control_enabled); // 5 more seconds
+    parseCmd("CTRL 1");
+    run_simulation(20000, log, true); // 5 more seconds
 
     log.close();
     std::cout << "Simulation complete. Log written to " << log_name << std::endl;
+
+    // Save identified secondary path (s_hat)
+    std::ofstream spath_file("sim_spath.csv");
+    spath_file << "Idx,Coeff" << std::endl;
+    for (int i = 0; i < S_TAPS; i++) {
+        spath_file << i << "," << s_hat[i] << std::endl;
+    }
+    spath_file.close();
 
     // Save final spectrum for analysis
     std::string spec_name = log_name.substr(0, log_name.find_last_of(".")) + "_spec.csv";

@@ -59,7 +59,20 @@ def plot_advanced(log_file):
     ax2.axvline(x=0.5, color='white', linestyle='--', alpha=0.5)
     ax2.axvline(x=1.5, color='white', linestyle='--', alpha=0.5)
 
-    plt.tight_layout()
+    # 3. Weight Evolution (New Subplot)
+    if 'W_S' in df.columns:
+        fig.set_size_inches(12, 14)
+        ax3 = fig.add_axes([0.1, 0.05, 0.8, 0.15]) # [left, bottom, width, height]
+        ax3.plot(time, df['W_S'], label='SOGI w_s', color='cyan')
+        ax3.plot(time, df['W_C'], label='SOGI w_c', color='magenta')
+        ax3.set_title('Adaptive Weights Evolution (Primary Resonator)', fontsize=14)
+        ax3.set_ylabel('Weight Value')
+        ax3.set_xlabel('Time [s]')
+        ax3.legend(loc='upper right')
+        ax3.grid(True, alpha=0.3)
+        ax3.axvline(x=1.5, color='black', linestyle='--', alpha=0.3)
+
+    plt.subplots_adjust(hspace=0.4, bottom=0.25)
     out_name = log_file.replace(".csv", "_advanced.png")
     plt.savefig(out_name, dpi=150)
     plt.close()

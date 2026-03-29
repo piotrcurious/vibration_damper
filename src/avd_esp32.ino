@@ -72,11 +72,11 @@ static constexpr int   S_TAPS  = 64;     // Secondary-path model Ŝ length
 static constexpr int   NUM_SOGI = 6;     // Number of parallel SOGI resonators
 
 // ── FxLMS algorithm ───────────────────────────────────────────────────────
-static constexpr float MU0             = 0.01f;    // FIR base step size
-static constexpr float MU_SOGI         = 0.03f;    // SOGI step size
+static constexpr float MU0             = 0.05f;    // FIR base step size
+static constexpr float MU_SOGI         = 0.15f;    // SOGI step size
 static constexpr float MU_S_HAT        = 0.005f;   // ASPM step size (slow and steady)
 static constexpr float MU_CEIL         = 0.3f;     // Absolute ceiling on μ_n
-static constexpr float LEAKAGE         = 0.9995f;  // Weights leakage to prevent drift
+static constexpr float LEAKAGE         = 0.9999f;  // Weights leakage to prevent drift
 static constexpr float POWER_ALPHA     = 0.999f;   // IIR smoothing for NLMS power estimate
 static constexpr float POWER_FLOOR     = 1e-8f;    // Prevents divide-by-zero
 
@@ -129,6 +129,7 @@ struct SogiQSG {
         w_s = w_c = 0;
         f_center = 0;
         pending_update = false;
+        pending_model_update = false;
     }
 
     // Initialize coefficients using Tustin transform
@@ -234,6 +235,7 @@ static float dc_ref = 0.0f, dc_err = 0.0f;
 
 // ── ASPM (Adaptive Secondary Path Modeling) ──────────────────────────────
 static bool           aspm_enabled = true;
+static bool           control_active = true;
 static float          dither_y     = 0.0f;
 static DelayLine<S_TAPS> dl_y;      // DAC output y[n] → ASPM Ŝ update
 
@@ -295,6 +297,7 @@ void IRAM_ATTR onTimer() {
     // ── 3. Hybrid Output Synthesis (SOGI Bank + FIR) ──────────────────────
     float y_n = 0;
 
+    if (control_active) {
     // a. SOGI Tonal Cancellation
     static int aspm_stride_idx = 0;
     aspm_stride_idx = (aspm_stride_idx + 1) % 128; // Every ~30 ms, flag SOGI to re-eval plant response
@@ -313,7 +316,7 @@ void IRAM_ATTR onTimer() {
         sogi_bank[i].process(x_n, u_s, u_c);
 
         // Output contribution: y[n] = Σ (w_s*u_s + w_c*u_c)
-        y_n += sogi_bank[i].w_s * u_s + sogi_bank[i].w_c * u_c;
+        y_n -= (sogi_bank[i].w_s * u_s + sogi_bank[i].w_c * u_c); // Output MUST cancel disturbance
 
         // Adaptive Weight Update (FxLMS)
         // Steady-state Filtered-x signals for a sinusoid at f_center:
@@ -325,14 +328,25 @@ void IRAM_ATTR onTimer() {
         // Normalization for SOGI (based on input power)
         float sogi_mu = MU_SOGI / (0.1f + u_sf*u_sf + u_cf*u_cf);
 
-        // Update weights
-        sogi_bank[i].w_s = LEAKAGE * sogi_bank[i].w_s - sogi_mu * e_n * u_sf;
-        sogi_bank[i].w_c = LEAKAGE * sogi_bank[i].w_c - sogi_mu * e_n * u_cf;
+        // Update weights (Gradient Descent)
+        // Weight update direction should be MINIMIZING e^2.
+        // e = d + S*y = d - S*(W*U).  de/dW = -S*U
+        // W = W - mu * e * de/dW = W + mu * e * (S*U)
+        sogi_bank[i].w_s = LEAKAGE * sogi_bank[i].w_s + sogi_mu * e_n * u_sf;
+        sogi_bank[i].w_c = LEAKAGE * sogi_bank[i].w_c + sogi_mu * e_n * u_cf;
+
+        // Anti-windup / Limiter for SOGI weights
+        const float W_MAX = 5.0f;
+        if (sogi_bank[i].w_s >  W_MAX) sogi_bank[i].w_s =  W_MAX;
+        if (sogi_bank[i].w_s < -W_MAX) sogi_bank[i].w_s = -W_MAX;
+        if (sogi_bank[i].w_c >  W_MAX) sogi_bank[i].w_c =  W_MAX;
+        if (sogi_bank[i].w_c < -W_MAX) sogi_bank[i].w_c = -W_MAX;
     }
 
     // b. Broadband FIR Contribution
     dl_x.push(x_n);
-    y_n += dl_x.dot(w);
+    y_n -= dl_x.dot(w); // Subtract to cancel
+    }
 
     // ── 3.5. Inject ASPM Dither (low-level white noise) ───────────────────
     if (aspm_enabled) {
@@ -356,7 +370,7 @@ void IRAM_ATTR onTimer() {
     const float xf_n = dl_s.dot(s_hat);
     dl_xf.push(xf_n);
 
-    // ── 6. Adaptive Secondary Path Modeling (ASPM) ───────────────────────
+    if (control_active) {
     // We update Ŝ[n] to minimize E[ (e[n] - Ŝ * y[n])^2 ]
     // This allows tracking mechanical changes during runtime.
     if (aspm_enabled) {
@@ -376,7 +390,8 @@ void IRAM_ATTR onTimer() {
     if (mu_n > MU_CEIL) mu_n = MU_CEIL;
 
     for (int i = 0; i < W_TAPS; i++) {
-        w[i] = LEAKAGE * w[i] - mu_n * e_n * dl_xf.tap(i);
+        w[i] = LEAKAGE * w[i] + mu_n * e_n * dl_xf.tap(i);
+    }
     }
 
     // ── 7. RMS accumulation (100 ms block) ────────────────────────────────
@@ -505,12 +520,20 @@ static void fftTask(void*) {
                 fft_spectrum[i] = (float)(fft_re[i] / norm);
 
             // Tonal Inference: Find dominant peaks and update SOGI bank
-            // 1. Find local peaks in the spectrum
-            struct Peak { int bin; float mag; };
+            // 1. Find local peaks with Sub-bin Parabolic Interpolation
+            struct Peak { float freq; float mag; };
             std::vector<Peak> peaks;
-            for (int i = 5; i < FFT_SIZE / 2 - 5; i++) { // Ignore DC and high-freq noise
-                if (fft_spectrum[i] > fft_spectrum[i-1] && fft_spectrum[i] > fft_spectrum[i+1] && fft_spectrum[i] > 0.005f) {
-                    peaks.push_back({i, fft_spectrum[i]});
+            for (int i = 5; i < FFT_SIZE / 2 - 5; i++) {
+                float y1 = fft_spectrum[i-1];
+                float y2 = fft_spectrum[i];
+                float y3 = fft_spectrum[i+1];
+
+                if (y2 > y1 && y2 > y3 && y2 > 0.005f) {
+                    // Parabolic interpolation: p = 0.5 * (y1 - y3) / (y1 - 2*y2 + y3)
+                    float p = 0.5f * (y1 - y3) / (1e-9f + y1 - 2.0f*y2 + y3);
+                    float refined_bin = (float)i + p;
+                    float refined_freq = refined_bin * (float)SAMPLE_RATE / FFT_SIZE;
+                    peaks.push_back({refined_freq, y2});
                 }
             }
             std::sort(peaks.begin(), peaks.end(), [](const Peak& a, const Peak& b) { return a.mag > b.mag; });
@@ -518,13 +541,13 @@ static void fftTask(void*) {
             // 2. Assign top 6 peaks to SOGI bank
             for (int i = 0; i < NUM_SOGI; i++) {
                 if (i < (int)peaks.size()) {
-                    float freq = peaks[i].bin * (float)SAMPLE_RATE / FFT_SIZE;
-                    // If frequency has moved significantly (> 4 Hz), schedule update
-                    if (fabsf(freq - sogi_bank[i].f_center) > 4.0f && !sogi_bank[i].pending_update) {
+                    float freq = peaks[i].freq;
+                    // Hysteresis: only update if frequency moved > 3Hz
+                    if (fabsf(freq - sogi_bank[i].f_center) > 3.0f && !sogi_bank[i].pending_update) {
                         sogi_bank[i].next_f = freq;
                         sogi_bank[i].pending_update = true;
                     }
-                } else if (!sogi_bank[i].pending_update) {
+                } else if (!sogi_bank[i].pending_update && sogi_bank[i].f_center > 0) {
                     sogi_bank[i].next_f = 0;
                     sogi_bank[i].pending_update = true;
                 }
@@ -630,6 +653,10 @@ static void parseCmd(const String& raw) {
     } else if (cmd.startsWith("ASPM ")) {
         aspm_enabled = (cmd.substring(5).toInt() != 0);
         Serial.printf("[CMD] ASPM = %s\n", aspm_enabled ? "ON" : "OFF");
+
+    } else if (cmd.startsWith("CTRL ")) {
+        control_active = (cmd.substring(5).toInt() != 0);
+        Serial.printf("[CMD] Control = %s\n", control_active ? "ON" : "OFF");
 
     } else if (cmd == "WEIGHTS") {
         // Dump all W coefficients — useful for offline analysis.

@@ -19,8 +19,8 @@ Professional-grade real-time Active Vibration Damping (AVD) implementation for t
 ## 🚀 Core Features
 - **Hybrid Control**: Combines 6 dynamically-tuned **SOGI resonators** (for discrete tones) with a 64-tap **FIR FxLMS** filter (for broadband noise).
 - **Autonomous Adaptation (ASPM)**: Continuous identification of the secondary path resonance during active control via low-level dither injection.
-- **Dynamic Spectral Tracking**: Real-time FFT-based peak detection on Core 0 with hysteresis-protected resonator assignment.
-- **Production-Grade Plant Modeling**: Logarithmic chirp-based initial SYSID (20 Hz - 1.8 kHz) for high-fidelity plant initialization.
+- **Dynamic Spectral Tracking**: Real-time FFT-based peak detection with **Sub-bin Parabolic Interpolation** for high-resolution frequency tracking.
+- **Production-Grade Plant Modeling**: Logarithmic chirp-based initial SYSID with continuous background refinement via ASPM.
 - **Robustness Suite**: Built-in divergence protection, hard/soft limiters, and real-time RMS monitoring.
 
 ---
@@ -60,6 +60,11 @@ The system tracks moving disturbance frequencies (e.g., engine RPM ramps) using 
 The ASPM system allows the controller to follow rapid changes in the mechanical plant's internal resonance (simulated below as a 25 Hz/s drift).
 
 ![Plant Adaptation](verify_plant_drift_advanced.png)
+
+### Model Fidelity
+Diagnostic Bode plots verify that the identified FIR model (Ŝ) accurately tracks the theoretical mechanical resonance and phase delay of the system.
+
+![Model Fidelity](spath_accuracy.png)
 
 ---
 
