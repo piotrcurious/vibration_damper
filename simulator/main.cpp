@@ -2,13 +2,13 @@
 #include "Arduino.h"
 #include "driver/adc.h"
 #include "driver/dac.h"
-#include "arduinoFFT.h"
 #include "freertos/FreeRTOS.h"
 #include "driver/timer.h"
 #include <iostream>
 #include <vector>
 #include <cmath>
 #include <random>
+#include <algorithm>
 #include <algorithm>
 #include <fstream>
 #include <string>
@@ -26,6 +26,8 @@ float sp_x1=0, sp_x2=0, sp_y1=0, sp_y2=0;
 float disturbance_freq = 150.0f; // Hz
 float disturbance_freq2 = 300.0f; // Hz
 float drift_rate = 0.0f;         // Hz/s
+float plant_drift_rate = 0.0f;   // Hz/s (drift of mechanical resonance)
+float resonance_freq = 200.0f;
 float t_global = 0;
 
 float current_dac_value = 0; // -1.0 to 1.0
@@ -41,6 +43,33 @@ void update_plant_sim() {
     // Update drifting frequencies
     float f_now1 = disturbance_freq + drift_rate * t;
     float f_now2 = disturbance_freq2 + drift_rate * 2.1f * t;
+
+    // Update time-varying plant
+    if (plant_drift_rate != 0) {
+        float f_res_now = resonance_freq + plant_drift_rate * t;
+
+        // Sudden step change at t=3.5s if drift is negative (use as flag)
+        if (plant_drift_rate < -999.0f) {
+            f_res_now = (t > 3.5f) ? 350.0f : 200.0f;
+        }
+
+        // Keep resonance in a sane range
+        if (f_res_now < 50.0f) f_res_now = 50.0f;
+        if (f_res_now > 1800.0f) f_res_now = 1800.0f;
+
+        // Re-design resonator biquad coefficients on the fly
+        float omega = 2.0f * PI * f_res_now / FS;
+        float Q = 5.0f;
+        float alpha = sin(omega) / (2.0f * Q);
+        float a0 = 1.0f + alpha;
+        b0 = (1.0f - cos(omega)) / 2.0f / a0;
+        b1 = (1.0f - cos(omega)) / a0;
+        b2 = (1.0f - cos(omega)) / 2.0f / a0;
+        a1 = -2.0f * cos(omega) / a0;
+        a2 = (1.0f - alpha) / a0;
+        float gain = 1.0f / Q;
+        b0 *= gain; b1 *= gain; b2 *= gain;
+    }
 
     // 1. Generate Disturbance (Multi-tone with drift)
     current_dist = 0.5f * sin(2.0f * PI * f_now1 * t) +
@@ -65,6 +94,7 @@ void update_plant_sim() {
 
 // Design biquad coefficients for a simple resonator
 void design_resonator(float f_res, float Q) {
+    resonance_freq = f_res;
     float omega = 2.0f * PI * f_res / FS;
     float alpha = sin(omega) / (2.0f * Q);
 
@@ -76,7 +106,6 @@ void design_resonator(float f_res, float Q) {
     a2 = (1.0f - alpha) / a0;
 
     // Gain normalization - set peak gain to roughly 1.0
-    // At resonance, gain is roughly Q.
     float gain = 1.0f / Q;
     b0 *= gain; b1 *= gain; b2 *= gain;
 }
@@ -152,13 +181,15 @@ void xTaskCreatePinnedToCore(TaskFunction_t task, const char* name, uint32_t sta
 }
 
 // --- Simulation Loop ---
-void run_simulation(int steps, std::ofstream& log) {
+void run_simulation(int steps, std::ofstream& log, bool control_enabled) {
     for (int step = 0; step < steps; ++step) {
         update_plant_sim();
 
         // 4. Run Firmware Iteration (ISR)
-        if (!sysid_running) {
+        if (control_enabled && !sysid_running) {
             onTimer();
+        } else if (!control_enabled) {
+            current_dac_value = 0;
         }
 
         // Run background tasks (at ~50Hz)
@@ -170,9 +201,7 @@ void run_simulation(int steps, std::ofstream& log) {
             }
         }
 
-        if (step % 40 == 0) {
-            log << t_global << "," << current_dist << "," << current_dac_value << "," << current_adc_err << "," << v_rms_e << std::endl;
-        }
+        log << t_global << "," << current_dist << "," << current_dac_value << "," << current_adc_err << "," << v_rms_e << std::endl;
     }
 }
 
@@ -181,12 +210,15 @@ int main(int argc, char** argv) {
     float f_res = 200.0f;
     float Q = 5.0f;
     float drift = 0.0f;
+    bool control_enabled = true;
     std::string log_name = "sim_log.csv";
 
     if (argc >= 2) f_dist = std::stof(argv[1]);
     if (argc >= 3) f_res = std::stof(argv[2]);
     if (argc >= 4) log_name = argv[3];
     if (argc >= 5) drift = std::stof(argv[4]);
+    if (argc >= 6) control_enabled = (std::stoi(argv[5]) != 0);
+    if (argc >= 7) plant_drift_rate = std::stof(argv[6]);
 
     disturbance_freq = f_dist;
     drift_rate = drift;
@@ -198,17 +230,34 @@ int main(int argc, char** argv) {
     std::ofstream log(log_name);
     log << "Time,Disturbance,Actuator,Error,RMS_E" << std::endl;
 
-    std::cout << "Starting simulation: Disturbance=" << f_dist << "Hz, Resonance=" << f_res << "Hz" << std::endl;
-    run_simulation(2000, log); // 0.5 second
+    std::cout << "Starting simulation: Disturbance=" << f_dist << "Hz, Resonance=" << f_res << "Hz, Control=" << (control_enabled ? "ON" : "OFF") << std::endl;
 
-    std::cout << "Running SYSID..." << std::endl;
-    identifySecondaryPath();
+    // Phase 1: Baseline (No Control)
+    run_simulation(2000, log, false); // 0.5 second
 
-    std::cout << "Resuming simulation with identified S_hat..." << std::endl;
-    run_simulation(4000, log); // 1 more second
+    // Phase 2: Calibration (SYSID)
+    if (control_enabled) {
+        std::cout << "Running SYSID..." << std::endl;
+        identifySecondaryPath();
+    }
+
+    // Phase 3: Active Control
+    std::cout << "Resuming simulation with Active Control..." << std::endl;
+    run_simulation(20000, log, control_enabled); // 5 more seconds
 
     log.close();
     std::cout << "Simulation complete. Log written to " << log_name << std::endl;
+
+    // Save final spectrum for analysis
+    std::string spec_name = log_name.substr(0, log_name.find_last_of(".")) + "_spec.csv";
+    std::ofstream spec(spec_name);
+    spec << "Hz,Magnitude" << std::endl;
+    for (int i = 1; i < FFT_SIZE / 2; i++) {
+        float hz = i * (float)SAMPLE_RATE / FFT_SIZE;
+        spec << hz << "," << fft_spectrum[i] << std::endl;
+    }
+    spec.close();
+    std::cout << "Final spectrum written to " << spec_name << std::endl;
 
     return 0;
 }

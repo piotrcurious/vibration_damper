@@ -1,31 +1,23 @@
 import subprocess
 import os
-import pandas as pd
 
-def run_scenario(f_dist, f_res, drift=0):
-    log_name = f"scenario_{int(f_dist)}_{int(f_res)}_{int(drift)}.csv"
-    cmd = f"./simulator/sim {f_dist} {f_res} {log_name} {drift}"
-    print(f"Running scenario: F_dist={f_dist}, F_res={f_res}, Drift={drift}")
-    subprocess.run(cmd, shell=True, check=True, capture_output=True)
-    return log_name
+scenarios = [
+    # f_dist, f_res, log_name, drift, control
+    (150, 200, "sim_150_200_off.csv", 0, 0),
+    (150, 200, "sim_150_200_on.csv", 0, 1),
+    (250, 200, "sim_250_200_on.csv", 0, 1),
+    (150, 200, "sim_drift_on.csv", 25, 1),
+]
 
-def main():
-    # Define scenarios (f_dist, f_res, drift)
-    scenarios = [
-        (150, 200, 0),   # Standard Case
-        (200, 250, 25),  # Frequency drift 25 Hz/s
-    ]
+def run():
+    if not os.path.exists("simulator/sim"):
+        print("Simulator not found. Please compile first.")
+        return
 
-    # Compile
-    cmd = "g++ -O3 -I simulator/mock_arduino -I simulator/mock_esp32 -I simulator/arduinoFFT simulator/main.cpp -o simulator/sim"
-    subprocess.run(cmd, shell=True, check=True)
-
-    results = []
-    for f_dist, f_res, drift in scenarios:
-        log_name = run_scenario(f_dist, f_res, drift)
-        results.append((f_dist, f_res, drift, log_name))
-
-    print("All scenarios completed.")
+    for f_dist, f_res, log, drift, control in scenarios:
+        cmd = ["./simulator/sim", str(f_dist), str(f_res), log, str(drift), str(control)]
+        print(f"Running: {' '.join(cmd)}")
+        subprocess.run(cmd)
 
 if __name__ == "__main__":
-    main()
+    run()
