@@ -50,6 +50,14 @@ public:
             return 0.0f;
         }
     }
+
+    int toInt() const {
+        try {
+            return std::stoi(*this);
+        } catch (...) {
+            return 0;
+        }
+    }
 };
 
 class SerialMock {

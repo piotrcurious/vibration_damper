@@ -505,12 +505,20 @@ static void fftTask(void*) {
                 fft_spectrum[i] = (float)(fft_re[i] / norm);
 
             // Tonal Inference: Find dominant peaks and update SOGI bank
-            // 1. Find local peaks in the spectrum
-            struct Peak { int bin; float mag; };
+            // 1. Find local peaks with Sub-bin Parabolic Interpolation
+            struct Peak { float freq; float mag; };
             std::vector<Peak> peaks;
-            for (int i = 5; i < FFT_SIZE / 2 - 5; i++) { // Ignore DC and high-freq noise
-                if (fft_spectrum[i] > fft_spectrum[i-1] && fft_spectrum[i] > fft_spectrum[i+1] && fft_spectrum[i] > 0.005f) {
-                    peaks.push_back({i, fft_spectrum[i]});
+            for (int i = 5; i < FFT_SIZE / 2 - 5; i++) {
+                float y1 = fft_spectrum[i-1];
+                float y2 = fft_spectrum[i];
+                float y3 = fft_spectrum[i+1];
+
+                if (y2 > y1 && y2 > y3 && y2 > 0.005f) {
+                    // Parabolic interpolation: p = 0.5 * (y1 - y3) / (y1 - 2*y2 + y3)
+                    float p = 0.5f * (y1 - y3) / (1e-9f + y1 - 2.0f*y2 + y3);
+                    float refined_bin = (float)i + p;
+                    float refined_freq = refined_bin * (float)SAMPLE_RATE / FFT_SIZE;
+                    peaks.push_back({refined_freq, y2});
                 }
             }
             std::sort(peaks.begin(), peaks.end(), [](const Peak& a, const Peak& b) { return a.mag > b.mag; });
@@ -518,13 +526,13 @@ static void fftTask(void*) {
             // 2. Assign top 6 peaks to SOGI bank
             for (int i = 0; i < NUM_SOGI; i++) {
                 if (i < (int)peaks.size()) {
-                    float freq = peaks[i].bin * (float)SAMPLE_RATE / FFT_SIZE;
-                    // If frequency has moved significantly (> 4 Hz), schedule update
-                    if (fabsf(freq - sogi_bank[i].f_center) > 4.0f && !sogi_bank[i].pending_update) {
+                    float freq = peaks[i].freq;
+                    // Hysteresis: only update if frequency moved > 3Hz
+                    if (fabsf(freq - sogi_bank[i].f_center) > 3.0f && !sogi_bank[i].pending_update) {
                         sogi_bank[i].next_f = freq;
                         sogi_bank[i].pending_update = true;
                     }
-                } else if (!sogi_bank[i].pending_update) {
+                } else if (!sogi_bank[i].pending_update && sogi_bank[i].f_center > 0) {
                     sogi_bank[i].next_f = 0;
                     sogi_bank[i].pending_update = true;
                 }

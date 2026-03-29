@@ -13,6 +13,8 @@ scenarios = [
     (250, 200, "verify_drift_on.csv", 15, 1, 0),
     (150, 200, "verify_plant_drift.csv", 0, 1, 25),
     (150, 200, "verify_plant_step.csv", 0, 1, -1000),
+    (150, 200, "verify_noisy.csv", 0, 1, 0, 0.2), # High broadband noise
+    (150, 200, "verify_shocks.csv", 0, 1, 0, 0.15), # Shocks (triggered by noise_level > 0.1)
 ]
 
 def run_verify():
@@ -23,7 +25,8 @@ def run_verify():
     for s in scenarios:
         f_dist, f_res, log, drift, control = s[0:5]
         plant_drift = s[5] if len(s) > 5 else 0
-        cmd = ["./simulator/sim", str(f_dist), str(f_res), log, str(drift), str(control), str(plant_drift)]
+        noise = s[6] if len(s) > 6 else 0.01
+        cmd = ["./simulator/sim", str(f_dist), str(f_res), log, str(drift), str(control), str(plant_drift), str(noise)]
         print(f"Running: {' '.join(cmd)}")
         subprocess.run(cmd)
 
