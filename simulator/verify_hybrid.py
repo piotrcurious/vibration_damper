@@ -2,26 +2,23 @@ import subprocess
 import os
 import pandas as pd
 import matplotlib.pyplot as plt
-import glob
+import numpy as np
 
 # Scenarios to test:
-# 1. 150Hz Disturbance, 200Hz Resonance (Clean tone)
-# 2. 300Hz Disturbance, 200Hz Resonance (Harmonic interference)
-# 3. 250Hz Disturbance, 200Hz Resonance, 15Hz/s Drift (Tracking)
-
+# f_dist, f_res, log_name, drift, control, plant_drift
 scenarios = [
-    # f_dist, f_res, log_name, drift, control, plant_drift
     (150, 200, "verify_150_off.csv", 0, 0, 0),
     (150, 200, "verify_150_on.csv", 0, 1, 0),
     (300, 200, "verify_300_on.csv", 0, 1, 0),
     (250, 200, "verify_drift_on.csv", 15, 1, 0),
-    (150, 200, "verify_plant_drift.csv", 0, 1, 20), # 20 Hz/s plant resonance drift
+    (150, 200, "verify_plant_drift.csv", 0, 1, 25),
+    (150, 200, "verify_plant_step.csv", 0, 1, -1000),
 ]
 
 def run_verify():
     if not os.path.exists("simulator/sim"):
         print("Compiling simulator...")
-        subprocess.run("g++ -DSIMULATOR -I simulator/mock_arduino -I simulator/mock_esp32 -I simulator/arduinoFFT simulator/main.cpp -o simulator/sim", shell=True)
+        subprocess.run("g++ -O3 -DSIMULATOR -I simulator/mock_arduino -I simulator/mock_esp32 -I simulator/arduinoFFT simulator/main.cpp -o simulator/sim", shell=True)
 
     for s in scenarios:
         f_dist, f_res, log, drift, control = s[0:5]
@@ -30,72 +27,130 @@ def run_verify():
         print(f"Running: {' '.join(cmd)}")
         subprocess.run(cmd)
 
+def calculate_metrics(log_file):
+    if not os.path.exists(log_file):
+        return None
+    df = pd.read_csv(log_file)
+
+    # Calculate RMS of 'Error' column manually
+    def get_rms(window):
+        if window.empty: return 1.0
+        return np.sqrt((window['Error']**2).mean())
+
+    # Initial state (before SYSID)
+    initial = df[(df['Time'] < 0.45)]
+    # Steady state (last 2 seconds of simulation)
+    steady_state = df[df['Time'] > (df['Time'].max() - 2.0)]
+
+    rms_initial = get_rms(initial)
+    rms_final = get_rms(steady_state)
+
+    # Avoid log of zero or negative
+    reduction_db = 20 * np.log10(max(1e-6, rms_initial) / max(1e-6, rms_final))
+    return {
+        "Initial RMS": rms_initial,
+        "Final RMS": rms_final,
+        "Reduction (dB)": reduction_db
+    }
+
+def print_summary():
+    print("\n" + "="*50)
+    print(" VERIFICATION SUMMARY")
+    print("="*50)
+    print(f"{'Scenario':<25} | {'Reduction':<10}")
+    print("-" * 50)
+    for s in scenarios:
+        if s[4] == 0: continue # Skip 'OFF'
+        metrics = calculate_metrics(s[2])
+        if metrics:
+            print(f"{s[2]:<25} | {metrics['Reduction (dB)']:>6.1f} dB")
+    print("="*50 + "\n")
+
 def plot_verify():
-    # 1. Compare 150Hz On vs Off
-    plt.figure(figsize=(12, 6))
+    plt.style.use('seaborn-v0_8-muted')
+
+    # 1. Performance Overview
+    fig, ax = plt.subplots(figsize=(12, 6))
     if os.path.exists("verify_150_off.csv"):
         df_off = pd.read_csv("verify_150_off.csv")
-        plt.plot(df_off['Time'], df_off['RMS_E'], label='Control OFF', color='gray', alpha=0.5)
+        ax.plot(df_off['Time'], df_off['Error'], label='Control OFF', color='gray', alpha=0.3, linewidth=0.5)
 
     if os.path.exists("verify_150_on.csv"):
         df_on = pd.read_csv("verify_150_on.csv")
-        plt.plot(df_on['Time'], df_on['RMS_E'], label='Control ON (Hybrid SOGI-FxLMS)', color='blue')
-        plt.axvline(x=0.5, color='red', linestyle='--', label='SYSID Start')
-        plt.axvline(x=1.5, color='green', linestyle='--', label='Control Start')
+        # Plot smoothed error for clarity
+        ax.plot(df_on['Time'], df_on['Error'], label='Error Signal (Control ON)', color='#1f77b4', alpha=0.6, linewidth=0.5)
 
-    plt.title("Cancellation Performance: 150 Hz Tone + Harmonics")
-    plt.xlabel("Time (s)")
-    plt.ylabel("RMS Error")
-    plt.legend()
-    plt.grid(True)
-    plt.savefig("verification_convergence.png")
-    print("Saved: verification_convergence.png")
+        # Calculate a rolling RMS for plotting
+        window = 100
+        rolling_rms = np.sqrt((df_on['Error']**2).rolling(window=window).mean())
+        ax.plot(df_on['Time'], rolling_rms, label='RMS Error', color='#d62728', linewidth=2)
 
-    # 2. Spectral Analysis
-    plt.figure(figsize=(12, 6))
+        ax.axvline(x=0.5, color='black', alpha=0.5, linestyle='--', label='SYSID Point')
+        ax.axvline(x=1.5, color='green', alpha=0.5, linestyle='--', label='Convergence')
+
+    ax.set_title("Hybrid SOGI-FxLMS Convergence & Damping Performance", fontsize=14)
+    ax.set_xlabel("Time (s)", fontsize=12)
+    ax.set_ylabel("Amplitude", fontsize=12)
+    ax.legend(frameon=True, loc='upper right')
+    ax.grid(True, alpha=0.3)
+    ax.set_ylim(-1.0, 1.0)
+    plt.tight_layout()
+    plt.savefig("verification_performance.png", dpi=150)
+    plt.close()
+
+    # 2. Spectral Suppression
+    fig, ax = plt.subplots(figsize=(12, 6))
     if os.path.exists("verify_150_off_spec.csv"):
         df_off_spec = pd.read_csv("verify_150_off_spec.csv")
-        plt.semilogy(df_off_spec['Hz'], df_off_spec['Magnitude'], label='Control OFF', color='gray', alpha=0.5)
+        ax.semilogy(df_off_spec['Hz'], df_off_spec['Magnitude'], label='Control OFF', color='gray', alpha=0.4)
 
     if os.path.exists("verify_150_on_spec.csv"):
         df_on_spec = pd.read_csv("verify_150_on_spec.csv")
-        plt.semilogy(df_on_spec['Hz'], df_on_spec['Magnitude'], label='Control ON', color='blue')
+        ax.semilogy(df_on_spec['Hz'], df_on_spec['Magnitude'], label='Control ON', color='#1f77b4', linewidth=1.5)
 
-    plt.title("Error Spectrum: Control ON vs OFF (150 Hz Disturbance)")
-    plt.xlabel("Frequency (Hz)")
-    plt.ylabel("Magnitude (log)")
-    plt.xlim(0, 1000)
-    plt.legend()
-    plt.grid(True)
-    plt.savefig("verification_spectrum.png")
-    print("Saved: verification_spectrum.png")
+    ax.set_title("Steady-State Power Spectrum (Residual Noise vs Tonal Cancellation)", fontsize=14)
+    ax.set_xlabel("Frequency (Hz)", fontsize=12)
+    ax.set_ylabel("Magnitude (log)", fontsize=12)
+    ax.set_xlim(0, 1200)
+    ax.legend()
+    ax.grid(True, which='both', alpha=0.2)
+    plt.tight_layout()
+    plt.savefig("verification_spectrum.png", dpi=150)
+    plt.close()
 
-    # 3. Drift Tracking
+    # 3. Dynamic Adaptation (Drift and Plant)
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10))
+
+    def plot_rms_log(ax, file, color, label):
+        df = pd.read_csv(file)
+        rms = np.sqrt((df['Error']**2).rolling(window=200).mean())
+        ax.plot(df['Time'], rms, color=color, label=label, linewidth=2)
+        ax.axvline(x=1.5, color='green', alpha=0.3, linestyle='--')
+        ax.grid(True, alpha=0.3)
+        ax.set_ylabel("RMS Error")
+        ax.legend()
+
     if os.path.exists("verify_drift_on.csv"):
-        plt.figure(figsize=(12, 6))
-        df_drift = pd.read_csv("verify_drift_on.csv")
-        plt.plot(df_drift['Time'], df_drift['RMS_E'], color='orange')
-        plt.axvline(x=1.5, color='green', linestyle='--', label='Control Start')
-        plt.title("Frequency Drift Tracking (15 Hz/s)")
-        plt.xlabel("Time (s)")
-        plt.ylabel("RMS Error")
-        plt.grid(True)
-        plt.savefig("verification_drift.png")
-        print("Saved: verification_drift.png")
+        plot_rms_log(ax1, "verify_drift_on.csv", "#ff7f0e", "Frequency Tracking: 15 Hz/s Drift")
+        ax1.set_title("Disturbance Frequency Tracking Performance", fontsize=14)
 
-    # 4. Plant Drift Adaptation
     if os.path.exists("verify_plant_drift.csv"):
-        plt.figure(figsize=(12, 6))
-        df_pd = pd.read_csv("verify_plant_drift.csv")
-        plt.plot(df_pd['Time'], df_pd['RMS_E'], color='purple')
-        plt.axvline(x=1.5, color='green', linestyle='--', label='Control Start')
-        plt.title("Plant Resonance Drift Adaptation (20 Hz/s)")
-        plt.xlabel("Time (s)")
-        plt.ylabel("RMS Error")
-        plt.grid(True)
-        plt.savefig("verification_plant_drift.png")
-        print("Saved: verification_plant_drift.png")
+        plot_rms_log(ax2, "verify_plant_drift.csv", "#9467bd", "ASPM Tracking: 25 Hz/s Resonance Drift")
+
+        if os.path.exists("verify_plant_step.csv"):
+            df_step = pd.read_csv("verify_plant_step.csv")
+            rms_step = np.sqrt((df_step['Error']**2).rolling(window=200).mean())
+            ax2.plot(df_step['Time'], rms_step, color='#2ca02c', label='Plant Step Change (200->350 Hz)', alpha=0.7)
+            ax2.axvline(x=3.5, color='red', alpha=0.3, linestyle=':')
+
+        ax2.set_title("Runtime Mechanical Plant Adaptation (ASPM)", fontsize=14)
+        ax2.set_xlabel("Time (s)")
+
+    plt.tight_layout()
+    plt.savefig("verification_adaptation.png", dpi=150)
+    plt.close()
 
 if __name__ == "__main__":
     run_verify()
+    print_summary()
     plot_verify()

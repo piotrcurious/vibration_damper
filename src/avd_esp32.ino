@@ -91,7 +91,7 @@ static constexpr float DC_ALPHA        = 0.995f;   // ≈ 3 Hz at 4 kHz
 static constexpr int   ADC_MIDPOINT    = 2048;
 static constexpr float ADC_NORM        = 1.0f / 2048.0f;  // → ±1.0 normalised
 static constexpr int   DAC_MIDPOINT    = 128;              // 8-bit mid-rail = 0 V AC
-static constexpr float DAC_SCALE       = 127.0f;           // ±1.0 → ±127 DAC counts
+static constexpr float DAC_SCALE       = 80.0f;            // Reduced scale to provide headroom for dither
 
 // ── GPIO ──────────────────────────────────────────────────────────────────
 static constexpr dac_channel_t DAC_ACT = DAC_CHANNEL_1;   // GPIO25
@@ -343,6 +343,9 @@ void IRAM_ATTR onTimer() {
     // Clip to ±1.0 (hard limiter; protects actuator)
     if      (y_n >  1.0f) y_n =  1.0f;
     else if (y_n < -1.0f) y_n = -1.0f;
+
+    // Scale down if we are hitting the limit consistently (soft limiter idea)
+    // For now, let's just make sure we are not saturating the DAC too easily
 
     // ── 4. Drive actuator ─────────────────────────────────────────────────
     const int dac_out = DAC_MIDPOINT + (int)(y_n * DAC_SCALE);

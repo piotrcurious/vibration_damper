@@ -47,6 +47,12 @@ void update_plant_sim() {
     // Update time-varying plant
     if (plant_drift_rate != 0) {
         float f_res_now = resonance_freq + plant_drift_rate * t;
+
+        // Sudden step change at t=3.5s if drift is negative (use as flag)
+        if (plant_drift_rate < -999.0f) {
+            f_res_now = (t > 3.5f) ? 350.0f : 200.0f;
+        }
+
         // Keep resonance in a sane range
         if (f_res_now < 50.0f) f_res_now = 50.0f;
         if (f_res_now > 1800.0f) f_res_now = 1800.0f;
@@ -225,14 +231,18 @@ int main(int argc, char** argv) {
     log << "Time,Disturbance,Actuator,Error,RMS_E" << std::endl;
 
     std::cout << "Starting simulation: Disturbance=" << f_dist << "Hz, Resonance=" << f_res << "Hz, Control=" << (control_enabled ? "ON" : "OFF") << std::endl;
-    run_simulation(2000, log, control_enabled); // 0.5 second
 
+    // Phase 1: Baseline (No Control)
+    run_simulation(2000, log, false); // 0.5 second
+
+    // Phase 2: Calibration (SYSID)
     if (control_enabled) {
         std::cout << "Running SYSID..." << std::endl;
         identifySecondaryPath();
     }
 
-    std::cout << "Resuming simulation..." << std::endl;
+    // Phase 3: Active Control
+    std::cout << "Resuming simulation with Active Control..." << std::endl;
     run_simulation(20000, log, control_enabled); // 5 more seconds
 
     log.close();
